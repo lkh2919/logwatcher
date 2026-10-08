@@ -522,6 +522,17 @@ class CombinedAnalysisTest(unittest.TestCase):
         self.assertNotIn("scanner", keys(self.st([nocap], recent_days=0)))
         self.assertIn("scanner", keys(self.st([nocap, n], recent_days=0)))
 
+    def test_merge_same_second_same_url_keeps_each_ip_once(self):
+        # 같은 초에 같은 URL을 서로 다른 두 IP가 요청: 병합 후에도 IP마다 한 번씩만 집계되어야 한다
+        hl = ['Oct  6 08:43:09 localhost haproxy[1]: 7.7.7.%d:5000 [06/Oct/2026:08:43:09.100] main~ be/s 0/0/0/1/1 200 10 "GET /same HTTP/1.1"' % i
+              for i in (1, 2, 3)]
+        nl = [line(ip="10.0.0.5", req="GET /same HTTP/1.1", t="06/Oct/2026:08:43:09 +0900", xff="-") for _ in range(2)]
+        st = self.st([_write(self.tmp.name, "h.log", hl), _write(self.tmp.name, "n.log", nl)], recent_days=0)
+        a = st.analysis()["analyzer"]
+        self.assertEqual(a.total, 3)                                  # 3 + 2 - 합친 2
+        self.assertEqual(sorted((ip, x.n) for ip, x in a.ips.items()), [("7.7.7.1", 1), ("7.7.7.2", 1), ("7.7.7.3", 1)])
+        self.assertEqual(st.analysis()["merged"], 2)
+
     def test_haproxy_nginx_without_overlap_warns(self):
         h = _write(self.tmp.name, "h.log", _read("haproxy.log"))
         n = _write(self.tmp.name, "n.log", _read("nginx_clean.log"))
@@ -591,6 +602,128 @@ class CombinedAnalysisTest(unittest.TestCase):
         self.assertFalse(os.path.exists(d))
         self.assertTrue(os.path.exists(src))
         self.assertTrue(st.summary()["empty"])
+
+
+class ReaderOptimizationTest(unittest.TestCase):
+    """분석 범위 밖 로그를 읽지·파싱하지 않는 최적화가 결과를 바꾸지 않는지 확인한다."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        old = parser.BLOCK_LINES
+        parser.BLOCK_LINES = 50                   # 블록을 많이 만들어 건너뛰기 경로를 충분히 시험
+        self.addCleanup(lambda: setattr(parser, "BLOCK_LINES", old))
+
+    def lines(self, n=1000, shuffle=0):
+        rows = []
+        for i in range(n):
+            day = 1 + i * 20 // n                  # 20일에 걸친 로그
+            rows.append(line(ip="9.9.%d.%d" % (i % 200, i % 250), req="GET /p%d HTTP/1.1" % i,
+                             t="%02d/Oct/2026:%02d:%02d:%02d +0900" % (day, i % 24, i % 60, (i * 7) % 60)))
+        rng = __import__("random").Random(1)
+        for _ in range(shuffle):                   # 시각 순서가 조금 어긋난 로그
+            a, b = rng.randrange(n), rng.randrange(n)
+            rows[a], rows[b] = rows[b], rows[a]
+        return rows
+
+    def cutoff(self):
+        import calendar
+        return calendar.timegm((2026, 10, 14, 0, 0, 0, 0, 0, 0))
+
+    def same(self, name, rows, gz=False):
+        p = _write(self.tmp.name, name, rows, gz=gz)
+        rd = parser.LogReader(p)
+        rd.scan()
+        cut = self.cutoff()
+        full = [r for r in rd.records() if r[0] >= cut]
+        fast = [r for r in rd.records(cut) if r[0] >= cut]
+        self.assertEqual(fast, full, name)
+        self.assertTrue(full)
+        return rd, p
+
+    def test_cutoff_results_are_identical(self):
+        self.same("sorted.log", self.lines())
+        self.same("shuffled.log", self.lines(shuffle=200))            # 정렬되지 않은 로그도 정확해야 함
+        self.same("crlf.log", [l + "\r" for l in self.lines()])
+        self.same("sorted.gz", self.lines(), gz=True)
+        garbage = []
+        for i, l in enumerate(self.lines()):
+            garbage.append(l)
+            if i % 17 == 0:
+                garbage += ["garbage line", ""]
+        self.same("garbage.log", garbage)
+
+    def test_old_blocks_are_not_read(self):
+        rd, p = self.same("sorted.log", self.lines())
+        n_old = sum(1 for _ in rd.records())
+        list(rd.records(self.cutoff()))
+        # 범위 밖 블록을 건너뛰었으므로 읽은 줄 수가 전체보다 적다
+        self.assertLess(rd.info["lines"], n_old * 0.6)
+        self.assertGreater(len(rd.blocks), 10)
+
+    def test_everything_old_yields_nothing(self):
+        p = _write(self.tmp.name, "old.log", self.lines())
+        rd = parser.LogReader(p)
+        rd.scan()
+        import calendar
+        self.assertEqual(list(rd.records(calendar.timegm((2027, 1, 1, 0, 0, 0, 0, 0, 0)))), [])
+        self.assertEqual(len(list(rd.records(0))), 1000)
+
+    def test_fast_timestamp_equals_full_parser(self):
+        for name in ("nginx_access.log", "nginx_bracket_lb.log", "haproxy.log", "nginx_error.log"):
+            p = os.path.join(SAMPLES, name)
+            rd = parser.LogReader(p, 9, 7, 8)             # 시간대 변환 경로도 함께 확인
+            lp = rd._parser()
+            fast = parser._FastTS(rd.fmt, 9, 7, 8)
+            checked = 0
+            with open(p, "rb") as f:
+                for raw in f:
+                    rec = lp.parse(raw.decode("utf-8").rstrip("\n"))
+                    if rec is None or len(rec) not in (6, 11):
+                        continue
+                    ts = fast.ts(raw)
+                    if ts is not None:
+                        self.assertEqual(ts, rec[0], (name, raw[:80]))
+                        checked += 1
+            self.assertGreater(checked, 50, name)
+        self.assertFalse(parser._FastTS(parser.FMT_JSON, 9, 9, 9).enabled)             # JSON은 전체 파싱 경로
+
+    def test_scan_info_matches_full_read(self):
+        for name in ("nginx_access.log", "haproxy.log", "nginx_error.log", "nginx_json.log"):
+            rd = parser.LogReader(os.path.join(SAMPLES, name))
+            rd.scan()
+            scan_info = {k: rd.info[k] for k in ("lines", "parsed", "skipped", "first", "last")}
+            list(rd.records())
+            self.assertEqual({k: rd.info[k] for k in scan_info}, scan_info, name)
+
+    def test_large_file_sampling_still_detects_lb(self):
+        old = parser.SAMPLE_BYTES
+        parser.SAMPLE_BYTES = 5000                 # 작은 파일도 표본 추출 경로로 처리
+        self.addCleanup(lambda: setattr(parser, "SAMPLE_BYTES", old))
+        lb = "203.0.113.250"
+        rows = [line(ip=lb, req="GET /p%d HTTP/1.1" % i, xff="175.1.1.%d" % (i % 40)) for i in range(2000)]
+        rows += [line(ip="198.51.100.%d" % (i % 90), req="GET /d%d HTTP/1.1" % i, xff="-") for i in range(2000)]
+        p = _write(self.tmp.name, "lb.log", rows)
+        rd = parser.LogReader(p)
+        stats = rd.scan()
+        self.assertEqual(list(stats), [lb])                         # XFF가 붙은 IP만 기록(메모리 절약)
+        n, nx, xs = stats[lb]
+        self.assertGreater(n, 1000)                                 # 표본 비율만큼 환산
+        self.assertEqual(rd.info["parsed"], 4000)                   # 줄 수·기간은 표본과 무관하게 정확
+        a = Analyzer(cfg())
+        a.register_proxies({lb: stats[lb]})
+        self.assertEqual(list(a.auto_proxies), [lb])
+
+    def test_only_in_range_ips_are_kept_in_memory(self):
+        old = [line(ip="1.1.%d.%d" % (i // 250, i % 250), t="01/Sep/2026:10:00:00 +0900") for i in range(3000)]
+        new = [line(ip="2.2.2.%d" % i, t="10/Oct/2026:10:00:00 +0900") for i in range(20)]
+        st = server.State(cfg())
+        self.addCleanup(st.cleanup)
+        st.add_file("a.log", _write(self.tmp.name, "a.log", old + new), "a")
+        a = st.analysis()["analyzer"]
+        self.assertEqual(len(a.ips), 20)                            # 7일 밖의 3000개 IP는 집계 대상이 아님
+        self.assertEqual(a.total, 20)
+        self.assertEqual(st.analysis()["excluded"], 3000)
 
 
 class ServerTest(unittest.TestCase):
