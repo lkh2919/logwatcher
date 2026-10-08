@@ -112,6 +112,13 @@ HAProxy TCP 모드 로그(`option tcplog`)는 요청 URL이 없어 분석할 수
 | `rate_*`, `burst_max`, `error_*`, `notfound_distinct`, `login_*` | 각 규칙의 기준값 |
 | `display_utc_offset_hours` | 화면 표시 시간대(기본 9, KST) |
 
+## 보안 · 배포 시 참고
+
+- 화면은 `127.0.0.1`(이 PC)에서만 열리며, 실행할 때마다 바뀌는 **접근 토큰**이 있어야 데이터에 접근할 수 있습니다. 콘솔에 표시된 주소(`#` 뒤 토큰 포함)를 다른 사람에게 알려주지 마세요. 서버에서 여러 사용자가 함께 쓰는 환경에서는 토큰이 필요한 이유가 이것입니다. 토큰을 고정하려면 환경변수 `LOGWATCHER_TOKEN` 을 지정합니다.
+- 화면은 CSP 등 보안 헤더로 외부 요청을 차단합니다. 프로그램은 외부로 아무 것도 전송하지 않습니다(국가 판별은 `data/geoip.bin` 으로 로컬 처리).
+- 배포 파일은 코드 서명이 없어 일부 백신/SmartScreen 이 경고할 수 있습니다. 릴리스에 함께 올라가는 `LogWatcher.exe.sha256` 로 무결성을 확인하세요: `certutil -hashfile LogWatcher.exe SHA256`
+- 국가 데이터: DB-IP Lite (CC BY 4.0, https://db-ip.com).
+
 ## 한계
 
 - 로그 내용(URL, User-Agent, 응답코드) 기반 패턴 탐지입니다. **요청 본문(POST 데이터)에 숨은 공격은 보이지 않습니다.**

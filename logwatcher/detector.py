@@ -30,7 +30,9 @@ URL_MAX = 300
 # ---------------------------------------------------------------- URL 공격 패턴
 ATTACK_RULES = [
     ("sqli", [
-        r"union(\s|/\*.*?\*/)+(all\s+)?select", r"'\s*(or|and)\s+['\"]?\w+['\"]?\s*(=|like)",
+        # 주석(/* ... */)은 첫 */에서 반드시 끝나야 한다. (\s|/\*.*?\*/)+ 처럼 쓰면 같은 문자열을 나누는 방법이
+        # 지수적으로 늘어 /**/ 를 반복한 URL 한 줄(400자)로 분석이 멈춘다(ReDoS).
+        r"union(?:\s|/\*(?:[^*]|\*(?!/))*\*/)+(?:all(?:\s|/\*(?:[^*]|\*(?!/))*\*/)+)?select", r"'\s*(or|and)\s+['\"]?\w+['\"]?\s*(=|like)",
         r"\bor\s+1\s*=\s*1\b", r"sleep\(\s*\d+\s*\)", r"benchmark\(", r"waitfor\s+delay",
         r"information_schema", r"@@version", r"xp_cmdshell", r";\s*(drop|truncate|insert|delete|update)\s",
         r"extractvalue\(", r"updatexml\(", r"pg_sleep", r"dbms_pipe",
@@ -91,8 +93,11 @@ _EXEC_EXT = re.compile(r"\.(jsp|jspx|php\d?|phtml|asp|aspx|cgi|pl|sh|exe|war)$",
 _HEX_ESC = re.compile(r"\\x([0-9A-Fa-f]{2})")
 
 
+MAX_URL_ANALYZE = 8192      # 이보다 긴 URL은 앞부분만 검사한다(nginx 요청 줄 기본 한도 8KB). 정규식 폭주의 이중 방어
+
+
 def _decode(path, query):
-    s = path + ("?" + query if query else "")
+    s = (path + ("?" + query if query else ""))[:MAX_URL_ANALYZE]
     if "\\x" in s:          # nginx가 비정상 바이트를 \xHH 문자열로 남긴 경우
         s = _HEX_ESC.sub(lambda m: chr(int(m.group(1), 16)), s)
     if "%" in s or "+" in s:

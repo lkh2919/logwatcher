@@ -73,7 +73,18 @@ const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({"&":"&amp
 const LV = {3:"높음",2:"중간",1:"낮음"};
 const badge = l => `<span class="badge l${l}">${LV[l]||"-"}</span>`;
 
+// 접근 토큰: 프로그램이 열어 준 주소의 # 뒤에 있다. 서버로 전송되지 않으며, 읽은 뒤 주소창에서 지우고 이 탭에만 보관한다.
+let TOKEN = "";
+try { TOKEN = sessionStorage.getItem("lw_token") || ""; } catch (e) { /* 저장소를 못 쓰면 이번 로드에서만 사용 */ }
+if (location.hash.length > 1) {
+  TOKEN = decodeURIComponent(location.hash.slice(1));
+  try { sessionStorage.setItem("lw_token", TOKEN); } catch (e) { /* 무시 */ }
+  history.replaceState(null, "", location.pathname);
+}
+const authHeaders = () => ({"X-LW-Token": TOKEN});
+
 async function api(path, opt) {
+  opt = Object.assign({}, opt, {headers: Object.assign({}, authHeaders(), (opt || {}).headers)});
   const r = await fetch(path, opt);
   const j = await r.json().catch(() => ({error: "응답을 읽을 수 없습니다"}));
   if (!r.ok) throw new Error(j.error || r.status);
@@ -121,6 +132,19 @@ async function init() {
   await refresh();
 }
 
+// 토큰 헤더가 필요해 주소 이동 대신 fetch로 받아 저장한다
+async function downloadCsv() {
+  try {
+    const r = await fetch("/api/export/result.csv", {headers: authHeaders()});
+    if (!r.ok) throw new Error(r.status === 401 ? "접근 토큰이 올바르지 않습니다" : r.status);
+    const name = ((r.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/) || [])[1] || "result.csv";
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a");
+    a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } catch (e) { $("msg").innerHTML = `<span class="err">CSV 저장 실패: ${esc(e.message)}</span>`; }
+}
+
 function renderGeoNote() {
   const g = STATUS && STATUS.geo;
   $("geonote").innerHTML = g && g.available
@@ -133,7 +157,7 @@ async function upload(files) {
   for (const f of files) {
     msg.innerHTML = `분석 중… ${esc(f.name)}`;
     try {
-      const r = await fetch("/api/upload?name=" + encodeURIComponent(f.name), {method: "POST", body: f});
+      const r = await fetch("/api/upload?name=" + encodeURIComponent(f.name), {method: "POST", body: f, headers: authHeaders()});
       const j = await r.json();
       if (!r.ok) msg.innerHTML += `<div class="err">${esc(j.name || f.name)}: ${esc(j.error)}</div>`;
     } catch (e) { msg.innerHTML += `<div class="err">${esc(f.name)}: ${esc(e.message)}</div>`; }
@@ -234,7 +258,7 @@ function renderOut() {
     setSort(k === SUM.sort.key ? {dir: SUM.sort.dir === "desc" ? "asc" : "desc"} : {key: k});
   });
   $("mode").onchange = e => change("/api/mode?mode=" + e.target.value);
-  $("csv").onclick = () => { location.href = "/api/export/result.csv"; };
+  $("csv").onclick = downloadCsv;
   bindRange();
   o.querySelectorAll("tr.row").forEach(tr => tr.onclick = () => toggleDetail(tr));
   const lt = $("lowtoggle"); if (lt) lt.onclick = () => { SHOW_LOW = !SHOW_LOW; render(); };
@@ -331,7 +355,11 @@ drop.ondragover = e => { e.preventDefault(); drop.classList.add("on"); };
 drop.ondragleave = () => drop.classList.remove("on");
 drop.ondrop = e => { e.preventDefault(); drop.classList.remove("on"); if (e.dataTransfer.files.length) upload([...e.dataTransfer.files]); };
 $("reset").onclick = async () => { await api("/api/reset", {method: "POST"}); $("msg").textContent = ""; await refresh(); };
-init().catch(e => { $("msg").innerHTML = `<span class="err">${esc(e.message)}</span>`; });
+init().catch(e => {
+  $("msg").innerHTML = TOKEN
+    ? `<span class="err">${esc(e.message)}</span>`
+    : `<span class="err">접근 토큰이 없습니다. 프로그램 콘솔 창에 표시된 <b>화면 주소</b>(# 뒤의 토큰 포함)로 다시 여세요.</span>`;
+});
 </script>
 </body>
 </html>

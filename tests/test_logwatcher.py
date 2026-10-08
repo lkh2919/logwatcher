@@ -1113,6 +1113,48 @@ class SettingsRaceTest(unittest.TestCase):
         self.assertTrue(st.summary()["range"]["covers_all"])
 
 
+class SecurityHardeningTest(unittest.TestCase):
+    """로그 내용은 공격자가 만들 수 있는 입력이다: 분석 도구가 멈추거나 오작동하지 않아야 한다."""
+
+    def kind(self, url):
+        a = Analyzer(cfg())
+        path, _, q = url.partition("?")
+        return a._url_kind(url, path, q)
+
+    def test_sqli_regex_has_no_catastrophic_backtracking(self):
+        import time
+        # 수정 전에는 이런 URL 한 줄(약 400자)로 분석이 사실상 멈췄다(ReDoS)
+        for url in ("/a?x=union" + "/**/" * 100 + "z", "/a?x=union" + "/**/" * 2000 + "z",
+                    "/a?x=union" + "/*" * 4000, "/a?x=union" + " " * 8000 + "z", "/a?x=union" + "/* x */ " * 1000 + "z"):
+            t = time.time()
+            self.assertEqual(self.kind(url), "", url[:30])
+            self.assertLess(time.time() - t, 0.5, url[:30])
+
+    def test_sqli_detection_still_works_with_comment_obfuscation(self):
+        for url in ("/a?id=1 union select 1", "/a?id=1%20UNION%20ALL%20SELECT%201", "/a?id=1 UNION/**/SELECT 1",
+                    "/a?id=1 union/*x*/all/*y*/select 1", "/a?id=1 union/**//**/ /**/select 1", "/a?id=1 union" + " " * 300 + "select 1",
+                    "/a?id=1 union/* a * b */select 1"):
+            self.assertEqual(self.kind(url), "sqli", url)
+
+    def test_long_url_is_capped(self):
+        import time
+        import logwatcher.detector as det
+        self.assertEqual(det.MAX_URL_ANALYZE, 8192)
+        t = time.time()
+        self.assertEqual(self.kind("/a?x=1%27%20union%20select%201--" + "a" * 100000), "sqli")      # 앞부분의 공격은 긴 URL에서도 탐지
+        self.assertLess(time.time() - t, 1.0)
+
+    def test_hostile_values_never_reach_unescaped_output(self):
+        # 화면은 모든 값을 이스케이프하고, CSV는 수식 시작 문자를 무력화한다(브라우저 시험은 별도로 수행)
+        with open(os.path.join(ROOT, "web", "index.html"), encoding="utf-8") as f:
+            html = f.read()
+        self.assertIn("const esc = ", html)
+        self.assertNotIn("eval(", html)
+        self.assertNotIn("document.write", html)
+        for bad in ("=1+1", "+cmd", "-2", "@SUM(1)", "\t=x"):
+            self.assertTrue(server.csv_safe(bad).startswith("'"), bad)
+
+
 class ServerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1125,9 +1167,12 @@ class ServerTest(unittest.TestCase):
         cls.httpd.shutdown()
         cls.httpd.server_close()
 
-    def req(self, method, path, body=None, headers=None):
+    def req(self, method, path, body=None, headers=None, token=True):
         c = http.client.HTTPConnection("127.0.0.1", self.port)
-        c.request(method, path, body=body, headers=headers or {})
+        h = dict(headers or {})
+        if token and "X-LW-Token" not in h:
+            h["X-LW-Token"] = server.TOKEN                              # 화면이 보내는 것과 같은 접근 토큰
+        c.request(method, path, body=body, headers=h)
         r = c.getresponse()
         data = r.read()
         return r.status, data
@@ -1194,6 +1239,57 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(self.req("POST", "/api/reset", headers={"Origin": "https://evil.example"})[0], 403)
         self.assertEqual(self.req("GET", "/api/status", headers={"Host": "evil.example"})[0], 403)
         self.assertEqual(self.req("POST", "/api/reset", headers={"Origin": "http://127.0.0.1:%d" % self.port})[0], 200)
+
+    def test_api_requires_access_token(self):
+        # 같은 PC의 다른 사용자·프로그램이 토큰 없이 데이터를 보거나 바꾸지 못해야 한다
+        for method, path in (("GET", "/api/status"), ("GET", "/api/summary"), ("GET", "/api/ip?ip=1.1.1.1"),
+                             ("GET", "/api/export/result.csv"), ("POST", "/api/upload?name=x.log"), ("POST", "/api/reset"),
+                             ("POST", "/api/range?days=3"), ("POST", "/api/mode?mode=ip"), ("POST", "/api/sort?key=ip")):
+            self.assertEqual(self.req(method, path, token=False)[0], 401, path)
+            self.assertEqual(self.req(method, path, headers={"X-LW-Token": "wrong"}, token=False)[0], 401, path)
+            self.assertEqual(self.req(method, path, headers={"X-LW-Token": "é" * 3}, token=False)[0], 401, path)   # 비ASCII도 오류 없이 거부
+        self.assertEqual(self.req("GET", "/", token=False)[0], 200)                      # 화면 파일 자체에는 데이터가 없다
+        self.assertEqual(self.req("GET", "/favicon.ico", token=False)[0], 204)
+        self.assertEqual(self.req("GET", "/api/status")[0], 200)                         # 올바른 토큰이면 통과
+        # 토큰이 틀리면 업로드한 내용이 저장되지도 않는다
+        self.req("POST", "/api/reset")
+        self.req("POST", "/api/upload?name=x.log", b"1.2.3.4 - - [08/Oct/2026:10:00:00 +0900] \"GET / HTTP/1.1\" 200 1 \"-\" \"a\"\n", token=False)
+        self.assertTrue(json.loads(self.req("GET", "/api/summary")[1])["empty"])
+
+    def test_host_and_origin_still_enforced_with_valid_token(self):
+        self.assertEqual(self.req("GET", "/api/status", headers={"Host": "evil.example"})[0], 403)
+        self.assertEqual(self.req("POST", "/api/reset", headers={"Origin": "https://evil.example"})[0], 403)
+
+    def test_security_headers(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port)
+        c.request("GET", "/")
+        r = c.getresponse()
+        r.read()
+        h = {k.lower(): v for k, v in r.getheaders()}
+        csp = h["content-security-policy"]
+        for part in ("default-src 'none'", "connect-src 'self'", "frame-ancestors 'none'", "base-uri 'none'", "form-action 'none'"):
+            self.assertIn(part, csp)
+        self.assertNotRegex(csp, r"https?:|\*\s*[;]|\s\*\s")                                             # 외부 출처·와일드카드 불가
+        self.assertEqual(h["x-frame-options"], "DENY")
+        self.assertEqual(h["referrer-policy"], "no-referrer")
+        self.assertEqual(h["x-content-type-options"], "nosniff")
+        self.assertEqual(h["cache-control"], "no-store")
+
+    def test_token_is_random_per_run_and_env_override(self):
+        saved = (server.STATE, server.TOKEN)                 # make_server는 전역 상태를 바꾸므로 끝나면 되돌린다
+        self.addCleanup(lambda: (setattr(server, "STATE", saved[0]), setattr(server, "TOKEN", saved[1])))
+        tokens = set()
+        for _ in range(3):
+            httpd = server.make_server([0], cfg())
+            tokens.add(httpd.token)
+            httpd.server_close()
+        self.assertEqual(len(tokens), 3)                      # 실행마다 다른 값
+        self.assertTrue(all(len(t) >= 24 for t in tokens))
+        os.environ["LOGWATCHER_TOKEN"] = "fixed-token-for-test"
+        self.addCleanup(lambda: os.environ.pop("LOGWATCHER_TOKEN", None))
+        httpd = server.make_server([0], cfg())
+        self.assertEqual(httpd.token, "fixed-token-for-test")
+        httpd.server_close()
 
     def test_index_served(self):
         st, data = self.req("GET", "/")
