@@ -10,7 +10,7 @@ call :findpy || goto :nopy
 echo [1/2] PyInstaller 설치 중...
 %PY% -m pip install --upgrade pyinstaller || goto :err
 echo [2/2] LogWatcher.exe 만드는 중...
-%PY% -m PyInstaller --noconfirm --clean --onefile --name LogWatcher --add-data "web;web" run.py || goto :err
+%PY% -m PyInstaller --noconfirm --clean --onefile --name LogWatcher --add-data "web;web" --add-data "data;data" run.py || goto :err
 echo.
 echo 완료: dist\LogWatcher.exe
 pause

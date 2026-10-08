@@ -19,6 +19,7 @@ SAMPLES = os.path.join(ROOT, "samples")
 
 def cfg(**kw):
     c = json.loads(json.dumps(config.DEFAULTS))
+    c["geo_enabled"] = False          # 기존 테스트는 공인 IP를 자유롭게 쓰므로 국가 판별을 끈다(국가 판별은 GeoTest에서 검증)
     c.update(kw)
     return c
 
@@ -847,6 +848,271 @@ class SortTest(unittest.TestCase):
         self.assertEqual(st.summary()["sort"], {"key": "level", "dir": "desc", "ev": "asc"})
 
 
+class WildcardTest(unittest.TestCase):
+    def test_matcher_formats(self):
+        from logwatcher.detector import IpMatcher
+        m = IpMatcher(["198.51.*.*", "192.168.1.*", "10.0.0.0/8", "1.2.3.4", "  ", "garbage[", "203.0.*"])
+        ok = ["198.51.13.157", "198.51.0.1", "192.168.1.77", "10.1.2.3", "1.2.3.4", "203.0.113.9"]
+        no = ["198.52.1.1", "124.24.13.1", "192.168.2.1", "11.0.0.1", "1.2.3.5", "2001:db8::1"]
+        for ip in ok:
+            self.assertTrue(ip in m, ip)
+        for ip in no:
+            self.assertFalse(ip in m, ip)
+
+    def test_wildcard_is_not_cidr_only(self):
+        from logwatcher.detector import IpMatcher
+        self.assertTrue("198.51.13.157" in IpMatcher(["198.51.*.*"]))
+        self.assertFalse("198.51.13.157" in IpMatcher(["198.52.*.*"]))
+        self.assertTrue("2001:db8::1" in IpMatcher(["2001:db8:*"]))
+        self.assertTrue("ABCD::1" in IpMatcher(["abcd::*"]))                  # 대소문자 무시
+
+    def test_allow_ips_wildcard_end_to_end(self):
+        rows = [line(ip="198.51.13.157", ua="sqlmap"), line(ip="198.51.99.1", ua="sqlmap"), line(ip="198.52.1.1", ua="sqlmap")]
+        a = run(rows, cfg(allow_ips=["198.51.*.*"]))
+        self.assertEqual([x["ip"] for x in a.result()["ips"]], ["198.52.1.1"])
+        self.assertEqual(a.allowed_skipped, 2)
+
+    def test_trusted_proxies_wildcard(self):
+        a = run([line(ip="198.51.100.9", ua="sqlmap", xff="7.7.7.7")], cfg(trusted_proxies=["198.51.100.*"]))
+        self.assertEqual([x["ip"] for x in a.result()["ips"]], ["7.7.7.7"])
+
+
+class GeoTest(unittest.TestCase):
+    KR, US, AU = "168.126.63.1", "8.8.8.8", "1.1.1.1"
+
+    def geo_cfg(self, **kw):
+        return cfg(geo_enabled=True, **kw)
+
+    def test_lookup(self):
+        from logwatcher.geoip import load_geo
+        g = load_geo(self.geo_cfg())
+        self.assertTrue(g.available)
+        self.assertEqual((g.lookup(self.KR), g.lookup(self.US), g.lookup(self.AU)), ("KR", "US", "AU"))
+        self.assertEqual((g.lookup("10.1.1.1"), g.lookup("192.168.0.9"), g.lookup("127.0.0.1")), ("LAN", "LAN", "LAN"))
+        self.assertIn(g.lookup("203.0.113.9"), ("ZZ", "??"))                    # 문서용 대역은 내부망(LAN)이 아니라 예약/미확인
+        self.assertEqual(g.lookup("not-an-ip"), "??")
+        self.assertEqual(load_geo(cfg()).lookup(self.US), "??")                  # geo_enabled=False
+
+    def result(self, rows, **kw):
+        a = Analyzer(self.geo_cfg(**kw))
+        lp = parser.LineParser(parser.FMT_NGINX)
+        for l in rows:
+            a.feed(lp.parse(l))
+        return a, {x["ip"]: x for x in a.result()["ips"]}
+
+    def test_foreign_raises_medium_to_high_but_domestic_does_not(self):
+        _, r = self.result([line(ip=self.US, ua="sqlmap"), line(ip=self.KR, ua="sqlmap")])
+        us, kr = r[self.US], r[self.KR]
+        self.assertEqual((us["level"], us["base_level"], us["country"], us["foreign"]), (3, 2, "US", True))
+        self.assertEqual((kr["level"], kr["country"], kr["foreign"]), (2, "KR", False))
+        self.assertIn("foreign", [f["key"] for f in us["findings"]])
+        self.assertNotIn("foreign", [f["key"] for f in kr["findings"]])
+        self.assertEqual(us["country_name"], "미국")
+
+    def test_low_findings_are_not_raised(self):
+        _, r = self.result([line(ip=self.US)])                                  # 해외 접속만: 낮음 그대로
+        self.assertEqual((r[self.US]["level"], [f["key"] for f in r[self.US]["findings"]]), (1, ["foreign"]))
+
+    def test_foreign_login(self):
+        rows = [line(ip=self.US, req="POST /login HTTP/1.1", status=200)]
+        _, r = self.result(rows)
+        keys = [f["key"] for f in r[self.US]["findings"]]
+        self.assertEqual((r[self.US]["level"], r[self.US]["base_level"]), (3, 2))     # 중간 + 해외 -> 높음
+        self.assertIn("foreign_login", keys)
+        _, r = self.result([line(ip=self.KR, req="POST /login HTTP/1.1", status=200)])
+        self.assertEqual(r, {})                                                  # 국내 로그인은 탐지 대상 아님
+
+    def test_known_bots_and_proxies_are_not_foreign(self):
+        _, r = self.result([line(ip=self.US, ua="Mozilla/5.0 (compatible; Googlebot/2.1)", req="GET /.env HTTP/1.1", status=404)])
+        self.assertEqual((r[self.US]["level"], r[self.US]["foreign"]), (2, False))   # 봇이라 해외 가중 없음
+        _, r = self.result([line(ip=self.AU, ua="sqlmap")], trusted_proxies=[self.AU])
+        self.assertFalse(r[self.AU]["foreign"])                                  # LB/프록시 자체는 국가 판정 제외
+        _, r = self.result([line(ip="10.0.0.9", ua="sqlmap")])
+        self.assertEqual((r["10.0.0.9"]["country"], r["10.0.0.9"]["foreign"], r["10.0.0.9"]["level"]), ("LAN", False, 2))
+
+    def test_home_countries_setting(self):
+        _, r = self.result([line(ip=self.US, ua="sqlmap")], home_countries=["KR", "US"])
+        self.assertEqual((r[self.US]["level"], r[self.US]["foreign"]), (2, False))
+        _, r = self.result([line(ip=self.KR, ua="sqlmap")], home_countries=["JP"])
+        self.assertEqual((r[self.KR]["level"], r[self.KR]["foreign"]), (3, True))
+
+    def test_geo_off_disables_country_rules(self):
+        a = Analyzer(cfg(geo_enabled=False))
+        a.feed(parser.LineParser(parser.FMT_NGINX).parse(line(ip=self.US, ua="sqlmap")))
+        x = a.result()["ips"][0]
+        self.assertEqual((x["level"], x["country"], x["foreign"]), (2, "??", False))
+
+    def test_foreign_only_ips_are_capped(self):
+        import logwatcher.detector as det
+        old = det.FOREIGN_LIST_MAX
+        det.FOREIGN_LIST_MAX = 3
+        self.addCleanup(lambda: setattr(det, "FOREIGN_LIST_MAX", old))
+        rows = [line(ip="8.8.8.%d" % i) for i in range(1, 9)] + [line(ip="8.8.8.5")] * 4     # 8.8.8.5는 요청이 가장 많음
+        a = Analyzer(self.geo_cfg())
+        lp = parser.LineParser(parser.FMT_NGINX)
+        for l in rows:
+            a.feed(lp.parse(l))
+        res = a.result()
+        self.assertEqual(len(res["ips"]), 3)
+        self.assertEqual((res["foreign_omitted"], res["foreign_ips"]), (5, 8))
+        self.assertIn("8.8.8.5", [x["ip"] for x in res["ips"]])                  # 요청이 많은 쪽이 남는다
+        self.assertEqual(res["verdict"]["status"], "ok")                         # 해외 접속만으로는 이상 징후가 아님
+
+    def test_country_stats_and_summary(self):
+        rows = [line(ip=self.US, ua="sqlmap")] + [line(ip=self.KR)] * 3 + [line(ip="10.1.1.1")]
+        st = server.State(self.geo_cfg(recent_days=0))
+        self.addCleanup(st.cleanup)
+        with tempfile.TemporaryDirectory() as d:
+            st.add_file("a.log", _write(d, "a.log", rows), "a")
+        sm = st.summary()
+        c = {x["code"]: x for x in sm["countries"]}
+        self.assertEqual((c["KR"]["requests"], c["US"]["requests"], c["LAN"]["requests"]), (3, 1, 1))
+        self.assertEqual((c["US"]["foreign"], c["KR"]["foreign"], c["US"]["flagged"]), (True, False, 1))
+        self.assertTrue(sm["geo"]["available"])
+        self.assertEqual(sm["home_countries"], ["KR"])
+        self.assertEqual([x["country_name"] for x in sm["ips"]], ["미국"])
+        st.set_sort("country", "asc")
+        self.assertEqual(st.summary()["sort"]["key"], "country")
+        self.assertIn("미국", st.result_csv())
+
+
+class SettingsRaceTest(unittest.TestCase):
+    """설정(범위·모드·정렬)을 바꾸는 중에 분석이 돌고 있어도 잘못된 결과가 남지 않는지."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        rows = [line(ip="9.9.9.%d" % (i % 9), t="%02d/Oct/2026:12:00:00 +0900" % (1 + i % 10)) for i in range(60)]
+        self.path = _write(self.tmp.name, "a.log", rows)
+
+    def state(self, **kw):
+        st = server.State(cfg(**kw))
+        self.addCleanup(st.cleanup)
+        st.add_file("a.log", self.path, "a")
+        return st
+
+    def counting(self):
+        calls = []
+        real = server.analyze
+
+        def spy(entries, c, days, anchor, now):
+            calls.append(days)
+            return real(entries, c, days, anchor, now)
+        server.analyze = spy
+        self.addCleanup(lambda: setattr(server, "analyze", real))
+        return calls
+
+    def test_cached_analysis_is_reused_and_invalidated_by_key(self):
+        calls = self.counting()
+        st = self.state()
+        st.summary()
+        st.summary()
+        st.set_mode("ip")
+        st.set_sort("last")
+        st.summary()
+        self.assertEqual(calls, [7])                                  # 모드·정렬 변경은 다시 분석하지 않는다
+        st.set_days(3)
+        st.summary()
+        st.set_days(3)
+        st.summary()
+        self.assertEqual(calls, [7, 3])                               # 범위가 바뀌어야만 다시 분석
+        st.set_days(7)
+        st.summary()
+        self.assertEqual(calls, [7, 3])                               # 이미 계산한 범위로 되돌리면 다시 계산하지 않는다
+        st.add_file("b.log", self.path, "b")                          # 파일이 바뀌면 다시 분석
+        st.summary()
+        self.assertEqual(calls, [7, 3, 7])
+        self.assertEqual(len(st._cache), 1)                           # 이전 파일 구성의 분석은 버려진다
+
+    def test_results_are_cached_per_mode(self):
+        from logwatcher.detector import Analyzer as A
+        real, n = A.result, []
+
+        def spy(self_, setting=None):
+            n.append(setting)
+            return real(self_, setting)
+        A.result = spy
+        self.addCleanup(lambda: setattr(A, "result", real))
+        st = self.state()
+        st.summary()
+        st.set_mode("ip")
+        st.summary()
+        st.set_mode("auto")
+        st.summary()
+        st.set_sort("last")
+        st.summary()
+        self.assertEqual(n, ["auto", "ip"])                           # 같은 모드로 돌아오거나 정렬만 바꾸면 결과를 다시 만들지 않는다
+
+    def test_cache_is_bounded(self):
+        calls = self.counting()
+        st = self.state()
+        for d in (1, 3, 7, 14, 30):
+            st.set_days(d)
+            st.summary()
+        self.assertEqual(len(st._cache), server.CACHE_MAX_ENTRIES)    # 최근 N개만 보관
+        st.set_days(30)
+        st.summary()
+        self.assertEqual(calls, [1, 3, 7, 14, 30])                    # 가장 최근 것은 다시 계산하지 않는다
+        st.set_days(1)
+        st.summary()
+        self.assertEqual(calls[-1], 1)                                # 오래된 것은 버려졌으므로 다시 계산
+        old = server.CACHE_MAX_IPS
+        server.CACHE_MAX_IPS = 1                                      # IP가 많으면(여기서는 임계값 1) 하나만 보관
+        self.addCleanup(lambda: setattr(server, "CACHE_MAX_IPS", old))
+        st.set_days(3)
+        st.summary()
+        self.assertEqual(len(st._cache), 1)
+
+    def test_change_during_analysis_is_applied_and_not_overwritten(self):
+        import threading
+        real, started, release = server.analyze, threading.Event(), threading.Event()
+
+        def slow(entries, c, days, anchor, now):
+            started.set()
+            release.wait(5)
+            return real(entries, c, days, anchor, now)
+        server.analyze = slow
+        self.addCleanup(lambda: setattr(server, "analyze", real))
+        st = self.state()
+        out = {}
+        t = threading.Thread(target=lambda: out.update(first=st.summary()))
+        t.start()
+        self.assertTrue(started.wait(5))
+        t0 = __import__("time").time()
+        st.set_days(14)                                               # 분석이 도는 중에도 설정은 즉시 바뀐다(잠금에 막히지 않음)
+        self.assertLess(__import__("time").time() - t0, 1.0)
+        server.analyze = real
+        release.set()
+        t.join(10)
+        self.assertEqual(out["first"]["days"], 14)                    # 7일로 계산하던 낡은 결과가 14일 설정으로 남지 않는다
+        sm = st.summary()
+        self.assertEqual((sm["days"], sm["range"]["days"]), (14, 14))
+
+    def test_stale_request_is_skipped(self):
+        calls = self.counting()
+        st = self.state()
+        v = st.version
+        st.set_days(3)                                                # 그 사이 더 새로운 설정이 들어옴
+        out = st.summary(expect_version=v)
+        self.assertEqual(out, {"stale": True, "version": st.version})
+        self.assertEqual(calls, [])                                   # 낡은 요청은 분석하지 않는다
+        sm = st.summary(expect_version=st.version)
+        self.assertEqual((sm["days"], calls), (3, [3]))
+
+    def test_range_covers_all_hint(self):
+        st = self.state(recent_days=7)
+        rg = st.summary()["range"]
+        self.assertTrue(rg["covers_all"] is False or rg["covers_all"] is True)
+        st.set_days(30)
+        rg = st.summary()["range"]
+        self.assertTrue(rg["covers_all"])                             # 로그 기간(10일)이 30일보다 짧음
+        self.assertEqual((rg["log_from"][:10], rg["log_to"][:10]), ("2026-10-01", "2026-10-10"))
+        st.set_days(3)
+        self.assertFalse(st.summary()["range"]["covers_all"])
+        st.set_days(0)
+        self.assertTrue(st.summary()["range"]["covers_all"])
+
+
 class ServerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -894,9 +1160,11 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(self.req("POST", "/api/upload?name=a.log", f.read())[0], 200)
         s = json.loads(self.req("GET", "/api/summary")[1])
         self.assertEqual(s["range"]["days"], 7)
-        self.assertEqual(self.req("POST", "/api/range?days=1")[0], 200)
-        s = json.loads(self.req("GET", "/api/summary")[1])
+        st, data = self.req("POST", "/api/range?days=1")
+        self.assertEqual(st, 200)
+        s = json.loads(data)                                             # 설정 변경 요청이 새 결과를 바로 돌려준다
         self.assertEqual(s["range"]["days"], 1)
+        self.assertEqual(json.loads(self.req("GET", "/api/summary")[1])["range"]["days"], 1)
         self.assertIn("in_range", s["files"][0])
         for bad in ("abc", "-1", "99999", ""):
             self.assertEqual(self.req("POST", "/api/range?days=" + bad)[0], 400, bad)

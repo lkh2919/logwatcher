@@ -6,6 +6,7 @@ result()에서 IP별 판정(ip 모드) 또는 요청 단위 판정(request 모�
 
 위험도: 3=높음, 2=중간, 1=낮음
 """
+import fnmatch
 import heapq
 import ipaddress
 import re
@@ -14,6 +15,8 @@ from collections import Counter
 from urllib.parse import unquote_plus
 
 from . import guide
+from .geoip import PRIVATE, UNKNOWN, country_name, load_geo
+from .netutil import is_internal, valid_ip  # noqa: F401  (is_internal은 테스트·호환용으로 재노출)
 from .parser import IP, METHOD, PATH, QUERY, STATUS, TS, UA, XFF, _split_request
 
 HIGH, MEDIUM, LOW = 3, 2, 1
@@ -21,6 +24,7 @@ LEVEL_LABEL = {HIGH: "높음", MEDIUM: "중간", LOW: "낮음", 0: "-"}
 
 EVIDENCE_MAX = 30          # 항목별 근거 로그 보관 상한
 SOFT_MAX = 10              # 에러/로그인 등 보조 근거 상한
+FOREIGN_LIST_MAX = 2000    # 해외 접속만 있는 IP를 목록에 올리는 상한(요청 수가 많은 순)
 URL_MAX = 300
 
 # ---------------------------------------------------------------- URL 공격 패턴
@@ -115,15 +119,17 @@ def _ua_kind(ua):
 
 
 class IpMatcher:
-    """IP 문자열 또는 CIDR 목록 포함 여부."""
+    """IP 문자열, CIDR(10.0.0.0/8), 와일드카드(198.51.*.*)를 섞은 목록의 포함 여부."""
 
     def __init__(self, items):
-        self.exact, self.nets = set(), []
+        self.exact, self.nets, self.pats = set(), [], []
         for it in items:
             it = str(it).strip()
             if not it:
                 continue
-            if "/" in it:
+            if "*" in it or "?" in it:
+                self.pats.append(re.compile(fnmatch.translate(it.lower())))
+            elif "/" in it:
                 try:
                     self.nets.append(ipaddress.ip_network(it, strict=False))
                 except ValueError:
@@ -132,41 +138,31 @@ class IpMatcher:
                 self.exact.add(it)
         self._cache = {}
 
+    def __bool__(self):
+        return bool(self.exact or self.nets or self.pats)
+
     def __contains__(self, ip):
         if ip in self.exact:
             return True
-        if not self.nets:
+        if not (self.nets or self.pats):
             return False
         v = self._cache.get(ip)
         if v is None:
-            try:
-                a = ipaddress.ip_address(ip)
-                v = any(a in n for n in self.nets)
-            except ValueError:
-                v = False
+            low = ip.lower()
+            v = any(p.match(low) for p in self.pats)
+            if not v and self.nets:
+                try:
+                    a = ipaddress.ip_address(ip)
+                    v = any(a in n for n in self.nets)
+                except ValueError:
+                    v = False
             if len(self._cache) > 100000:
                 self._cache.clear()
             self._cache[ip] = v
         return v
 
 
-_INTERNAL_NETS = [ipaddress.ip_network(n) for n in (
-    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10",
-    "::1/128", "fc00::/7", "fe80::/10")]
-
-
-def is_internal(addr):
-    """내부망/프록시로 볼 주소 (RFC1918, 루프백, 링크로컬, CGNAT, IPv6 ULA). 문서용 대역은 포함하지 않는다."""
-    if addr.version == 6 and addr.ipv4_mapped:
-        addr = addr.ipv4_mapped
-    return any(addr in n for n in _INTERNAL_NETS if n.version == addr.version)
-
-
-def _valid_ip(s):
-    try:
-        return ipaddress.ip_address(s.strip("[]"))
-    except ValueError:
-        return None
+_valid_ip = valid_ip
 
 
 def _max_window(times, window):
@@ -324,8 +320,11 @@ class _IpAcc:
 
 
 class Analyzer:
-    def __init__(self, cfg):
+    def __init__(self, cfg, geo=None):
         self.cfg = cfg
+        self.geo = geo if geo is not None else load_geo(cfg)
+        self.home = set(c.upper() for c in cfg["home_countries"])
+        self.bots = [b.lower() for b in cfg["known_bots"] if b]
         self.allow = IpMatcher(cfg["allow_ips"])
         self.trusted = IpMatcher(cfg["trusted_proxies"])
         self.allowed_methods = set(m.upper() for m in cfg["allowed_methods"])
@@ -334,7 +333,7 @@ class Analyzer:
         self.login_re = re.compile(cfg["login_url_pattern"], re.I) if cfg["login_url_pattern"] else None
         self.ignore_re = [re.compile(p) for p in cfg["probe_ignore_paths"] if p]
         self.use_xff = bool(cfg["use_xff"])
-        self.has_allow = bool(self.allow.exact or self.allow.nets)
+        self.has_allow = bool(self.allow)
         self._trust_cache = {}
         self.total = 0
         self.allowed_skipped = 0
@@ -652,7 +651,8 @@ class Analyzer:
     def _hit_finding(self, key, h, desc):
         return self._finding(key, h.level or guide.RULES[key]["level"], desc, h.count, h.success, h.status, h.rows)
 
-    def _ip_result(self, ip, a):
+    def _ip_result(self, ip, a, build_foreign=False):
+        """IP 하나의 탐지 결과. 해외 접속만 있는 IP는 build_foreign=False면 가벼운 표지만 돌려준다."""
         cfg = self.cfg
         fs = []
         hits = a.hits or {}
@@ -693,13 +693,35 @@ class Analyzer:
             if pc >= cfg["login_post_max"]:
                 fs.append(self._finding("login_burst", MEDIUM, "%d분 안에 로그인 POST %d건 (무차별 대입 의심)" % (
                     cfg["login_window_sec"] // 60, pc), pc, 0, Counter(), []))
+        # 국가 판별: 국내(home_countries) 이외는 '해외'. 알려진 봇과 LB/프록시 자체는 제외한다.
+        cc = self.geo.lookup(ip)
+        foreign = cc not in self.home and cc not in (PRIVATE, UNKNOWN, "ZZ")
+        uas = None
+        if foreign and not (ip in self.auto_proxies or ip in self.trusted):
+            uas = a.user_agents()
+            if any(b in (u or "").lower() for u in uas for b in self.bots):
+                foreign = False
+        else:
+            foreign = False
+        if foreign:
+            if x.login_post is not None and len(x.login_post):
+                fs.append(self._finding("foreign_login", MEDIUM, "해외(%s)에서 로그인 관련 POST %d건" % (
+                    country_name(cc), len(x.login_post)), len(x.login_post), 0, Counter(), []))
+            if fs or build_foreign:
+                fs.append(self._finding("foreign", LOW, "국가: %s, 요청 %d건" % (country_name(cc), a.n), a.n, 0, Counter(), []))
         if not fs:
+            if foreign:                              # 해외 접속만 있는 IP: 목록에는 상위 N개만 올린다
+                return {"level": 0, "foreign_only": True, "n": a.n}
             return {"level": 0}
-        fs.sort(key=lambda f: (-f["level"], -f["success"], -f["count"]))
-        level = max(f["level"] for f in fs)
-        uas = a.user_agents()
+        fs.sort(key=lambda f: (f["key"] == "foreign", -f["level"], -f["success"], -f["count"]))
+        level = base = max(f["level"] for f in fs)
+        other = max((f["level"] for f in fs if f["key"] != "foreign"), default=0)
+        if foreign and other >= MEDIUM and level < HIGH:        # 해외 IP가 '중간' 이상 항목에 걸리면 한 단계 상향
+            level += 1
+        uas = uas if uas is not None else a.user_agents()
         return {
-            "ip": ip, "level": level, "level_label": LEVEL_LABEL[level],
+            "ip": ip, "level": level, "base_level": base, "level_label": LEVEL_LABEL[level],
+            "country": cc, "country_name": country_name(cc), "foreign": foreign,
             "score": round(sum(f["level"] * 10 + min(f["count"], 100) / 10.0 for f in fs), 1),
             "requests": a.n, "errors": a.err, "first": fmt_ts(a.first), "last": fmt_ts(a.last),
             "success_warn": any(f["success"] and f["key"] in guide.SUCCESS_WARN_KEYS for f in fs),
@@ -715,10 +737,33 @@ class Analyzer:
         res = {"mode": used, "setting": setting, "unreliable": info["unreliable"], "reason": info["reason"],
                "distinct_ips": len(self.ips), "xff_used": self.xff_used, "ips": [], "findings": [],
                "auto_proxies": [{"ip": ip, "requests": n} for ip, n in sorted(self.auto_proxies.items(), key=lambda kv: -kv[1])],
-               "errorlog": self.error_summary()}
+               "errorlog": self.error_summary(), "countries": [], "foreign_omitted": 0, "foreign_ips": 0,
+               "geo": {"available": self.geo.available, "source": self.geo.source}}
         if used == "ip":
-            ips = [self._ip_result(ip, a) for ip, a in self.ips.items()]
-            ips = [x for x in ips if x["level"]]
+            ips, foreign_only, cstats = [], [], {}
+            for ip, a in self.ips.items():
+                r = self._ip_result(ip, a)
+                cc = self.geo.lookup(ip)
+                c = cstats.get(cc)
+                if c is None:
+                    c = cstats[cc] = [0, 0, 0]
+                c[0] += a.n
+                c[1] += 1
+                if r["level"] >= MEDIUM:
+                    c[2] += 1
+                if r.get("foreign_only"):
+                    foreign_only.append((r["n"], ip))
+                elif r["level"]:
+                    ips.append(r)
+            with_findings = sum(1 for x in ips if x.get("foreign"))      # 다른 탐지 항목도 있는 해외 IP
+            top = heapq.nlargest(FOREIGN_LIST_MAX, foreign_only)
+            ips += [self._ip_result(ip, self.ips[ip], build_foreign=True) for _n, ip in top]
+            res["foreign_omitted"] = len(foreign_only) - len(top)
+            res["foreign_ips"] = len(foreign_only) + with_findings
+            res["countries"] = [{"code": cc, "name": country_name(cc), "requests": v[0], "ips": v[1], "flagged": v[2],
+                                 "foreign": cc not in self.home and cc not in (PRIVATE, UNKNOWN, "ZZ")}
+                                for cc, v in sorted(cstats.items(), key=lambda kv: -kv[1][0])[:40]]
+            res["home_countries"] = sorted(self.home)
             ips.sort(key=lambda x: (-x["level"], not x["success_warn"], -x["score"], -x["requests"]))
             res["ips"] = ips
             levels = Counter(x["level"] for x in ips)

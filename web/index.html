@@ -38,6 +38,11 @@ tr.row{cursor:pointer}tr.row:hover{background:var(--bg)}
 .muted{color:var(--sub)}
 details summary{cursor:pointer;color:var(--acc)}
 .err{color:var(--hi)}
+#out.busy{opacity:.45;transition:opacity .15s}
+#busy{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:9;background:var(--acc);color:#fff;border-radius:20px;padding:6px 16px;font-weight:600;box-shadow:0 2px 10px rgba(0,0,0,.25);display:none}
+#busy.on{display:block}
+.foreign{color:var(--mid);font-weight:600}
+footer{max-width:1100px;margin:0 auto;padding:4px 16px 24px;font-size:12px;color:var(--sub)}
 th.sortable{cursor:pointer;user-select:none;white-space:nowrap}th.sortable:hover{color:var(--ink)}th.on{color:var(--acc)}
 .info{background:var(--lob);color:var(--lo);border-radius:8px;padding:8px 12px;margin-bottom:12px}
 .ev td{font-size:12px}
@@ -45,6 +50,7 @@ th.sortable{cursor:pointer;user-select:none;white-space:nowrap}th.sortable:hover
 </style>
 </head>
 <body>
+<div id="busy" role="status" aria-live="polite"></div>
 <header><b>LogWatcher</b><span>nginx·HAProxy 위협 로그 점검 · <span id="ver"></span></span></header>
 <main>
   <div class="card">
@@ -58,6 +64,7 @@ th.sortable{cursor:pointer;user-select:none;white-space:nowrap}th.sortable:hover
   <div id="out"></div>
   <details class="card" id="lvguide"><summary>위험도 기준 안내</summary><div id="lvbody"></div></details>
 </main>
+<footer id="geonote"></footer>
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
@@ -73,6 +80,38 @@ async function api(path, opt) {
   return j;
 }
 
+let SEQ = 0, BUSY_T0 = 0, BUSY_TIMER = null;
+function busy(on, text) {
+  const b = $("busy"), out = $("out");
+  clearInterval(BUSY_TIMER);
+  if (!on) { b.classList.remove("on"); out.classList.remove("busy"); return; }
+  BUSY_T0 = Date.now();
+  const tick = () => { b.textContent = `${text} ${Math.floor((Date.now() - BUSY_T0) / 1000)}초`; };
+  tick(); b.classList.add("on"); out.classList.add("busy");
+  BUSY_TIMER = setInterval(tick, 250);
+}
+function render() {
+  const y = window.scrollY;                         // 다시 그려도 보던 위치를 유지
+  renderFiles(); renderOut(); renderGeoNote();
+  window.scrollTo(0, y);
+}
+// 설정(분석 범위·IP 구분·정렬)을 바꾸면 같은 요청으로 새 결과를 받는다.
+// 로그가 크면 몇 초 걸리므로 '분석 중'을 바로 보여주고, 그 사이 또 바꾸면 마지막 선택만 반영한다.
+async function change(url) {
+  const my = ++SEQ;
+  busy(true, "분석 중…");
+  try {
+    const j = await api(url, {method: "POST"});
+    if (my !== SEQ) return;                         // 더 새로운 선택이 있었음: 이 응답은 버린다
+    SUM = j.stale ? await api("/api/summary") : j;
+    render();
+  } catch (e) {
+    if (my === SEQ) $("msg").innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  } finally {
+    if (my === SEQ) busy(false);
+  }
+}
+
 async function init() {
   STATUS = await api("/api/status");
   $("ver").textContent = "v" + STATUS.version;
@@ -80,6 +119,13 @@ async function init() {
     `<p>${badge(g.level)} <b>${esc(g.when)}</b> — ${esc(g.summary)}</p><ul>${g.detail.map(d => `<li>${esc(d)}</li>`).join("")}</ul>`).join("") +
     `<ul>${STATUS.level_notes.map(n => `<li>${esc(n)}</li>`).join("")}</ul>`;
   await refresh();
+}
+
+function renderGeoNote() {
+  const g = STATUS && STATUS.geo;
+  $("geonote").innerHTML = g && g.available
+    ? `IP 국가 정보: <a href="https://db-ip.com" target="_blank" rel="noopener">IP Geolocation by DB-IP</a> (CC BY 4.0) · 데이터 ${esc((g.source.match(/\d{4}-\d\d/) || [""])[0])} 기준 · 국가 판별은 참고용이며 정확하지 않을 수 있습니다.`
+    : "";
 }
 
 async function upload(files) {
@@ -97,8 +143,16 @@ async function upload(files) {
 }
 
 async function refresh() {
-  SUM = await api("/api/summary");
-  renderFiles(); renderOut();
+  const my = ++SEQ;
+  busy(true, "분석 중…");
+  try {
+    const j = await api("/api/summary");
+    if (my !== SEQ) return;
+    SUM = j;
+    render();
+  } finally {
+    if (my === SEQ) busy(false);
+  }
 }
 
 function renderFiles() {
@@ -125,9 +179,16 @@ function rangeText() {
     (r.excluded ? ` · 범위 밖 ${r.excluded.toLocaleString()}줄 제외` : "");
 }
 
+function rangeHint() {
+  const r = SUM.range;
+  return r && r.days && r.covers_all
+    ? `올린 로그의 기간(${r.log_from} ~ ${r.log_to})이 선택한 범위(최근 ${r.days}일)보다 짧아 로그 전체가 포함됩니다. 범위를 바꿔도 결과가 같은 것은 이 때문입니다.`
+    : "";
+}
+
 function bindRange() {
   const sel = $("range");
-  if (sel) sel.onchange = async e => { await api("/api/range?days=" + e.target.value, {method: "POST"}); await refresh(); };
+  if (sel) sel.onchange = e => change("/api/range?days=" + e.target.value);
 }
 
 function renderOut() {
@@ -142,6 +203,7 @@ function renderOut() {
   const v = SUM.verdict, req = SUM.mode === "request";
   const notes = [];
   (SUM.notes || []).forEach(n => notes.push({cls: n.type === "warn" ? "warn" : "info", text: esc(n.text)}));
+  if (rangeHint()) notes.push({cls: "info", text: esc(rangeHint())});
   if ((SUM.auto_proxies || []).length)
     notes.push({cls: "warn", text: `LB/프록시로 자동 판단된 IP: ${SUM.auto_proxies.map(p => `<b class="mono">${esc(p.ip)}</b>(${p.requests.toLocaleString()}건)`).join(", ")} — 이 IP가 보낸 요청은 <b>X-Forwarded-For의 실제 접속자 IP</b>로 판정했습니다. 맞지 않으면 config.json의 <span class="mono">auto_proxy</span>를 false로 바꾸세요.`});
   let h = `<div id="verdict" class="${v.status}">${v.status === "ok" ? "✔ " : "⚠ "}${esc(v.text)}
@@ -158,11 +220,12 @@ function renderOut() {
     <button class="pri" id="csv">결과 CSV 저장</button></div>`;
   h += req ? renderFindings() : renderIps();
   h += `</div>`;
+  h += req ? "" : renderCountries();
   h += renderErrorLog();
   o.innerHTML = h;
   $("mode").value = SUM.mode_setting;
   $("evdir").value = SUM.sort.ev;
-  $("evdir").onchange = e => setSort({ev: e.target.value});
+  $("evdir").onchange = e => change("/api/sort?ev=" + e.target.value);
   const sk = $("sortkey");
   if (sk) { sk.value = SUM.sort.key; sk.onchange = e => setSort({key: e.target.value}); }
   const sd = $("sortdir"); if (sd) sd.onclick = () => setSort({dir: SUM.sort.dir === "desc" ? "asc" : "desc"});
@@ -170,11 +233,22 @@ function renderOut() {
     const k = th.dataset.key;
     setSort(k === SUM.sort.key ? {dir: SUM.sort.dir === "desc" ? "asc" : "desc"} : {key: k});
   });
-  $("mode").onchange = async e => { await api("/api/mode?mode=" + e.target.value, {method: "POST"}); await refresh(); };
+  $("mode").onchange = e => change("/api/mode?mode=" + e.target.value);
   $("csv").onclick = () => { location.href = "/api/export/result.csv"; };
   bindRange();
   o.querySelectorAll("tr.row").forEach(tr => tr.onclick = () => toggleDetail(tr));
-  const lt = $("lowtoggle"); if (lt) lt.onclick = () => { SHOW_LOW = !SHOW_LOW; renderOut(); };
+  const lt = $("lowtoggle"); if (lt) lt.onclick = () => { SHOW_LOW = !SHOW_LOW; render(); };
+}
+
+function renderCountries() {
+  const cs = SUM.countries || [];
+  if (!cs.length || !(SUM.geo && SUM.geo.available)) return "";
+  const home = (SUM.home_countries || []).join(", ");
+  let h = `<details class="card"><summary>국가별 접속 (국내 기준: ${esc(home)})</summary>
+    <p class="muted">해외 IP ${SUM.foreign_ips.toLocaleString()}개${SUM.foreign_omitted ? ` · 해외 접속만 있는 IP ${SUM.foreign_omitted.toLocaleString()}개는 목록에서 생략(요청이 많은 상위 2,000개만 표시)` : ""}. 국가는 요청 수 순이며 상위 ${cs.length}개입니다.</p>
+    <table><tr><th>국가</th><th>코드</th><th>요청 수</th><th>IP 수</th><th>높음·중간 IP</th></tr>`;
+  h += cs.map(c => `<tr><td class="${c.foreign ? "foreign" : ""}">${esc(c.name)}</td><td class="mono">${esc(c.code)}</td><td>${c.requests.toLocaleString()}</td><td>${c.ips.toLocaleString()}</td><td>${c.flagged ? `<b class="sw">${c.flagged}</b>` : "-"}</td></tr>`).join("");
+  return h + `</table></details>`;
 }
 
 function renderErrorLog() {
@@ -191,10 +265,11 @@ function renderErrorLog() {
 }
 
 let SHOW_LOW = false;
-const SORT_LABEL = {level: "위험도", last: "마지막 접근", first: "첫 접근", requests: "요청 수", ip: "IP"};
+const SORT_LABEL = {level: "위험도", last: "마지막 접근", first: "첫 접근", requests: "요청 수", ip: "IP", country: "국가"};
 const DIR_LABEL = {
   last: {desc: "최신순", asc: "오래된 순"}, first: {desc: "최신순", asc: "오래된 순"},
   requests: {desc: "많은 순", asc: "적은 순"}, level: {desc: "높은 순", asc: "낮은 순"}, ip: {desc: "큰 순", asc: "작은 순"},
+  country: {desc: "가나다 역순", asc: "가나다순"},
 };
 function sortControls() {
   const s = SUM.sort, dl = DIR_LABEL[s.key][s.dir];
@@ -205,19 +280,15 @@ function sortTh(key, text) {
   const s = SUM.sort, on = s.key === key;
   return `<th class="sortable${on ? " on" : ""}" data-key="${key}" title="눌러서 정렬 (다시 누르면 방향 반대)">${text}${on ? (s.dir === "desc" ? " ▼" : " ▲") : ""}</th>`;
 }
-async function setSort(p) {
-  const q = new URLSearchParams(p).toString();
-  await api("/api/sort?" + q, {method: "POST"});
-  await refresh();
-}
+function setSort(p) { return change("/api/sort?" + new URLSearchParams(p).toString()); }
 function renderIps() {
   if (!SUM.ips.length) return `<p class="muted">탐지된 IP가 없습니다.</p>`;
   const lowN = SUM.ips.filter(x => x.level === 1).length;
   const rows = SUM.ips.filter(x => SHOW_LOW || x.level > 1);
   let h = lowN ? `<div class="bar muted">${SHOW_LOW ? "낮음 포함 전체" : "높음·중간만 표시"} (${rows.length}개) · 낮음(참고) ${lowN}개 <button id="lowtoggle">${SHOW_LOW ? "낮음 숨기기" : "낮음도 보기"}</button></div>` : "";
   if (!rows.length) return h + `<p class="muted">높음·중간으로 탐지된 IP가 없습니다.</p>`;
-  return h + `<table><tr>${sortTh("level", "위험도")}${sortTh("ip", "IP")}${sortTh("requests", "요청 수")}<th>탐지 내용</th>${sortTh("last", "접근 기간(마지막 접근순)")}</tr>` +
-    rows.map(x => `<tr class="row" data-ip="${esc(x.ip)}"><td>${badge(x.level)}</td><td class="mono">${esc(x.ip)}</td><td>${x.requests ? x.requests.toLocaleString() : "-"}</td>
+  return h + `<table><tr>${sortTh("level", "위험도")}${sortTh("ip", "IP")}${sortTh("country", "국가")}${sortTh("requests", "요청 수")}<th>탐지 내용</th>${sortTh("last", "접근 기간(마지막 접근순)")}</tr>` +
+    rows.map(x => `<tr class="row" data-ip="${esc(x.ip)}"><td>${badge(x.level)}</td><td class="mono">${esc(x.ip)}</td><td class="${x.foreign ? "foreign" : ""}" title="${esc(x.country)}">${esc(x.country_name || "")}</td><td>${x.requests ? x.requests.toLocaleString() : "-"}</td>
       <td>${x.is_proxy ? `<span class="chip" title="LB/프록시 자체의 요청이라 실제 접속자 IP를 알 수 없습니다">LB/프록시</span>` : ""}${x.findings.map(f => `<span class="chip l${f.level}">${esc(f.label)}</span>`).join("")}${x.success_warn ? ` <span class="sw" title="공격 요청이 2xx 정상 응답을 받았습니다">⚠ 정상 응답</span>` : ""}</td>
       <td class="mono">${esc(x.first)}<br>~ ${esc(x.last)}</td></tr>`).join("") + `</table>`;
 }
@@ -248,7 +319,7 @@ async function toggleDetail(tr) {
   if (nx && nx.classList.contains("dtl")) { nx.remove(); return; }
   const d = await api("/api/ip?ip=" + encodeURIComponent(tr.dataset.ip));
   const row = document.createElement("tr"); row.className = "dtl";
-  row.innerHTML = `<td colspan="5" class="detail"><div class="muted">User-Agent: <span class="mono">${esc(d.user_agent)}</span> · 응답코드 ${esc(d.statuses.map(([k, v]) => k + ":" + v).join(", "))}</div>
+  row.innerHTML = `<td colspan="6" class="detail"><div class="muted">국가: ${esc(d.country_name || "-")}${d.country ? ` (${esc(d.country)})` : ""}${d.foreign ? " · 해외" : ""} · User-Agent: <span class="mono">${esc(d.user_agent)}</span> · 응답코드 ${esc(d.statuses.map(([k, v]) => k + ":" + v).join(", "))}</div>
     ${d.findings.map(findingHtml).join("")}</td>`;
   tr.after(row);
 }

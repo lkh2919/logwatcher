@@ -6,10 +6,19 @@ import os
 from .resources import app_dir
 
 DEFAULTS = {
+    # 국가 판별(해외 접속 규칙·국가 표시). false면 끈다
+    "geo_enabled": True,
+    # 국내로 간주할 국가 코드(ISO 2글자). 이외 국가는 '해외 접속'으로 판정. 예: ["KR"] 또는 ["KR", "JP"]
+    "home_countries": ["KR"],
+    # User-Agent에 포함되면 '알려진 봇'으로 보고 해외 접속 판정에서 제외(UA는 위조될 수 있어 공격 패턴은 계속 검사)
+    "known_bots": [
+        "Googlebot", "bingbot", "Yeti", "Daum", "SkypeUriPreview", "Teams", "Slackbot",
+        "kakaotalk-scrap", "facebookexternalhit", "Applebot", "DuckDuckBot",
+    ],
     # IP 구분 방식: auto(자동 판별) / ip(항상 IP별 판정) / none(IP 구분 안 함, 요청 단위 판정)
     "ip_mode": "auto",
     # 완전히 신뢰하는 IP/대역(CIDR 가능): 모든 탐지에서 제외
-    "allow_ips": [],
+    "allow_ips": [],   # IP, CIDR(10.0.0.0/8), 와일드카드(198.51.*.*) 모두 가능
     # X-Forwarded-For를 믿을 프록시/LB 대역(CIDR 가능). 사설 IP(10.x, 172.16.x, 192.168.x)는 자동 신뢰
     "trusted_proxies": [],
     # X-Forwarded-For가 로그에 있으면 실제 접속자 IP로 사용
