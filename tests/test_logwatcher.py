@@ -2,6 +2,7 @@ import gzip
 import http.client
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -357,7 +358,7 @@ class DetectorTest(unittest.TestCase):
         self.assertNotIn("203.0.113.250", ips)
         # HAProxy: 접속자 IP가 바로 찍히고 서버 상태 줄은 서버 상태로 분리
         st, sm = load("haproxy.log")
-        self.assertEqual((sm["verdict"]["high"], sm["verdict"]["medium"]), (3, 3))
+        self.assertEqual((sm["verdict"]["high"], sm["verdict"]["medium"]), (2, 2))   # nginx에 직접 접속한 스캐너는 없음
         labels = {o["label"] for o in sm["errorlog"]["ops"]}
         self.assertIn("백엔드 서버 다운(HAProxy)", labels)
         self.assertIn("백엔드 서버 복구(HAProxy)", labels)
@@ -369,10 +370,227 @@ class DetectorTest(unittest.TestCase):
         self.assertEqual(sm["errorlog"]["levels"], {"emerg": 2, "error": 3, "info": 63})
         ips = {x["ip"]: x for x in sm["ips"]}
         self.assertEqual((ips["198.51.100.77"]["level"], ips["198.51.100.20"]["level"], ips["192.0.2.99"]["level"]), (1, 2, 2))
-        # haproxy + nginx 접근 로그를 함께 올리면 중복 집계 경고
+        # haproxy + nginx 접근 로그를 함께 올리면 같은 요청을 합쳐 집계 (HAProxy의 IP + nginx의 UA)
         st, sm = load("haproxy.log", "nginx_bracket_lb.log")
-        self.assertTrue(sm["warnings"])
-        self.assertFalse(load("haproxy.log", "nginx_error.log")[1]["warnings"])
+        self.assertEqual((sm["verdict"]["high"], sm["verdict"]["medium"]), (3, 3))     # 직접 접속 스캐너까지 모두
+        self.assertEqual([n["type"] for n in sm["notes"]], ["info"])
+        self.assertEqual(sm["total"], 868)                                              # 861 + 867 - 합친 860
+        self.assertEqual([f["merged"] for f in sm["files"]], [860, 860])
+        self.assertEqual(load("haproxy.log", "nginx_error.log")[1]["notes"], [])
+
+
+def _write(d, name, lines, gz=False):
+    p = os.path.join(d, name)
+    data = ("\n".join(lines) + "\n").encode("utf-8")
+    if gz:
+        with gzip.open(p, "wb") as f:
+            f.write(data)
+    else:
+        with open(p, "wb") as f:
+            f.write(data)
+    return p
+
+
+def _state(files, **kw):
+    st = server.State(cfg(**kw))
+    for p in files:
+        r = st.add_file(os.path.basename(p), p, p)
+        assert "error" not in r, r
+    return st
+
+
+def _read(name):
+    with open(os.path.join(SAMPLES, name), encoding="utf-8") as f:
+        return f.read().splitlines()
+
+
+class HaproxyVariantTest(unittest.TestCase):
+    CUSTOM = ('Oct  6 08:43:09 localhost haproxy[270451]: 124.1.1.%d:64317 [06/Oct/2026:08:43:%02d.632] main~ http_back/nginx2 '
+              '0/0/2/2/4 200 348 "GET /p%d HTTP/1.1" upgrade="-" connection="-"')
+
+    def body(self, n=200):
+        return [self.CUSTOM % (i % 50 + 1, i % 60, i) for i in range(n)]
+
+    def test_custom_log_format_without_termination_state(self):
+        lp = parser.LineParser(parser.FMT_HAPROXY, 9, 9, 9)
+        r = lp.parse(self.CUSTOM % (7, 9, 1))
+        self.assertEqual((r[parser.IP], r[parser.METHOD], r[parser.PATH], r[parser.STATUS], r[parser.BYTES]),
+                         ("124.1.1.7", "GET", "/p1", 200, 348))
+
+    def test_badreq(self):
+        lp = parser.LineParser(parser.FMT_HAPROXY, 9, 9, 9)
+        base = ('Oct  6 08:43:46 localhost haproxy[1]: 51.8.102.190:15913 [06/Oct/2026:08:43:46.189] main~ main/<NOSRV> '
+                '-1/-1/-1/-1/194 %d 0 "<BADREQ>" upgrade="-" connection="-"')
+        self.assertEqual(lp.parse(base % 408)[parser.METHOD], "-")          # 연결만 하고 요청 없음: 위협 아님
+        r = lp.parse(base % 400)
+        self.assertEqual((r[parser.METHOD], r[parser.PATH], r[parser.STATUS]), ("(INVALID)", "<BADREQ>", 400))
+        a = Analyzer(cfg())
+        a.feed(lp.parse(base % 408))
+        self.assertEqual(a.result()["ips"], [])
+        a.feed(lp.parse(base % 400))
+        self.assertIn("HAProxy가 거부한", a.result()["ips"][0]["findings"][0]["desc"])
+
+    def test_tls_events(self):
+        lp = parser.LineParser(parser.FMT_HAPROXY, 9, 9, 9)
+        a = Analyzer(cfg())
+        for msg in ("Timeout during SSL handshake", "Connection closed during SSL handshake", "SSL handshake failure"):
+            a.feed_error(lp.parse("Oct 23 10:46:01 localhost haproxy[1]: 8.8.8.8:58533 [23/Oct/2025:10:45:31.414] main/1: " + msg))
+        es = a.error_summary()
+        self.assertEqual((es["total"], es["noise"], es["security"]), (3, 2, 1))
+
+    def test_cut_and_modified_logs_are_still_read(self):
+        body = self.body()
+        variants = {
+            "첫 줄이 중간에서 잘림": [body[0][70:]] + body[1:],
+            "앞부분 삭제": body[100:],
+            "무작위 줄 삭제": [l for i, l in enumerate(body) if i % 3],
+            "syslog 접두 제거": [re.sub(r"^.*?haproxy\[\d+\]: ", "", l) for l in body],
+            "뒤쪽 필드 제거": [re.sub(r" upgrade=.*$", "", l) for l in body],
+            "응답코드·바이트 제거": [re.sub(r' (\d{3}) (\d+) "', ' "', l) for l in body],
+            "타이머 제거": [re.sub(r" [-\d]+/[-\d]+/[-\d]+/[-\d]+/[-\d]+ ", " ", l) for l in body],
+            "마지막 줄이 잘림": body[:-1] + [body[-1][:80]],
+            "앞쪽에 깨진 줄이 많음": ["garbage %d" % i for i in range(30)] + body,
+            "CRLF": [l + "\r" for l in body],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            for name, lines in variants.items():
+                rd = parser.LogReader(_write(d, "v.log", lines))
+                n = sum(1 for _ in rd.records())
+                self.assertEqual(rd.fmt, parser.FMT_HAPROXY, name)
+                self.assertGreaterEqual(n, len(lines) - 32, name)
+
+    def test_nginx_lines_are_not_mistaken_for_haproxy(self):
+        self.assertEqual(parser.detect_format([line(ip="1.2.3.%d" % i) for i in range(10)]), parser.FMT_NGINX)
+        self.assertEqual(parser.detect_format([BRACKET] * 5), parser.FMT_NGINX_BR)
+
+    def test_unsupported_shows_first_line(self):
+        with self.assertRaises(ValueError) as cm:
+            parser.detect_format(["hello world", "foo bar"])
+        self.assertIn("hello world", str(cm.exception))
+
+
+class CombinedAnalysisTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.states = []
+
+    def st(self, files, **kw):
+        s = _state(files, **kw)
+        self.states.append(s)
+        self.addCleanup(s.cleanup)
+        return s
+
+    def test_split_logs_equal_whole(self):
+        for name in ("nginx_access.log", "nginx_bracket_lb.log", "haproxy.log"):
+            lines = _read(name)
+            whole = self.st([_write(self.tmp.name, "w_" + name, lines)], recent_days=0).summary()
+            n = len(lines)
+            parts = [_write(self.tmp.name, "p1_" + name, lines[:n // 3]),
+                     _write(self.tmp.name, "p2_" + name + ".gz", lines[n // 3: 2 * n // 3], gz=True),
+                     _write(self.tmp.name, "p3_" + name, lines[2 * n // 3:])]
+            split = self.st(parts, recent_days=0).summary()
+            self.assertEqual(split["verdict"], whole["verdict"], name)
+            self.assertEqual([x["ip"] for x in split["ips"]], [x["ip"] for x in whole["ips"]], name)
+            self.assertEqual(split["total"], whole["total"], name)
+            self.assertEqual(split["auto_proxies"], whole["auto_proxies"], name)
+            self.assertEqual(len(split["files"]), 3)
+
+    def test_split_logs_detect_lb_across_files(self):
+        # 파일 하나만으로는 LB 판별 근거(요청 20건)가 부족해도, 전체를 합치면 판별된다
+        lb = "203.0.113.250"
+        lines = [line(ip=lb, req="GET /p%d HTTP/1.1" % i, xff="175.1.1.%d" % (i % 9), t="08/Oct/2026:10:00:%02d +0900" % (i % 60))
+                 for i in range(36)]
+        files = [_write(self.tmp.name, "a%d.log" % i, lines[i * 12:(i + 1) * 12]) for i in range(3)]
+        self.assertEqual(self.st(files[:1]).summary()["auto_proxies"], [])
+        sm = self.st(files).summary()
+        self.assertEqual([p["ip"] for p in sm["auto_proxies"]], [lb])
+        self.assertEqual(sm["unique_ips"], 9)
+
+    def test_haproxy_nginx_merge_is_order_independent(self):
+        h = _write(self.tmp.name, "h.log", _read("haproxy.log"))
+        n = _write(self.tmp.name, "n.log", _read("nginx_bracket_lb.log"))
+        a = self.st([h, n], recent_days=0).summary()
+        b = self.st([n, h], recent_days=0).summary()
+        for sm in (a, b):
+            self.assertEqual((sm["total"], sm["unique_ips"]), (868, 48))
+            self.assertEqual(sm["verdict"], a["verdict"])
+        self.assertEqual([x["ip"] for x in a["ips"]], [x["ip"] for x in b["ips"]])
+        # HAProxy가 User-Agent를 캡처하지 않았다면, nginx의 User-Agent(sqlmap)가 합쳐져 스캐너로 탐지된다
+        nocap = _write(self.tmp.name, "h_nocap.log", [re.sub(r" \{[^}]*\}", "", l) for l in _read("haproxy.log")])
+        keys = lambda st: [f["key"] for f in st.ip_detail("203.0.113.9")["findings"]]
+        self.assertNotIn("scanner", keys(self.st([nocap], recent_days=0)))
+        self.assertIn("scanner", keys(self.st([nocap, n], recent_days=0)))
+
+    def test_haproxy_nginx_without_overlap_warns(self):
+        h = _write(self.tmp.name, "h.log", _read("haproxy.log"))
+        n = _write(self.tmp.name, "n.log", _read("nginx_clean.log"))
+        sm = self.st([h, n], recent_days=0).summary()
+        self.assertEqual([x["type"] for x in sm["notes"]], ["warn"])
+        self.assertEqual([f["merged"] for f in sm["files"]], [0, 0])
+
+    def test_recent_days_window(self):
+        def at(day, ip, req="GET / HTTP/1.1", hh=12):
+            return line(ip=ip, req=req, t="%02d/Oct/2026:%02d:00:00 +0900" % (day, hh))
+        lines = [at(1, "9.9.9.1", "GET /a?id=1%27%20UNION%20SELECT%201-- HTTP/1.1"),     # 범위 밖
+                 at(2, "9.9.9.2", "GET /a?id=1%27%20UNION%20SELECT%201-- HTTP/1.1"),     # 범위 밖
+                 at(3, "9.9.9.3", "GET /a?id=1%27%20UNION%20SELECT%201-- HTTP/1.1"),     # 경계(10일 12시 - 7일 = 3일 12시): 포함
+                 at(5, "9.9.9.5"), at(10, "9.9.9.10", "GET /?q=%3Cscript%3Ealert(1)%3C/script%3E HTTP/1.1")]
+        p = _write(self.tmp.name, "w.log", lines)
+        st = self.st([p])                                       # 기본 7일
+        sm = st.summary()
+        self.assertEqual((sm["range"]["days"], sm["range"]["from"], sm["range"]["to"]), (7, "2026-10-03 12:00:00", "2026-10-10 12:00:00"))
+        self.assertEqual({x["ip"] for x in sm["ips"]}, {"9.9.9.3", "9.9.9.10"})
+        self.assertEqual((sm["total"], sm["range"]["excluded"], sm["files"][0]["in_range"], sm["files"][0]["excluded"]), (3, 2, 3, 2))
+        st.set_days(3)
+        self.assertEqual({x["ip"] for x in st.summary()["ips"]}, {"9.9.9.10"})
+        st.set_days(0)
+        sm = st.summary()
+        self.assertEqual((sm["total"], len(sm["ips"]), sm["range"]["from"]), (5, 4, ""))
+        with self.assertRaises(ValueError):
+            st.set_days(-1)
+
+    def test_recent_window_applies_to_every_log_kind(self):
+        err = ['2026/10/01 10:00:00 [emerg] 1#1: open() "/x" failed (13: Permission denied)',
+               '2026/10/10 10:00:00 [emerg] 1#1: open() "/y" failed (13: Permission denied)']
+        h = [HaproxyVariantTest.CUSTOM % (1, 1, 1), HaproxyVariantTest.CUSTOM.replace("06/Oct", "01/Sep") % (2, 2, 2)]
+        st = self.st([_write(self.tmp.name, "e.log", err), _write(self.tmp.name, "h.log", h)])
+        sm = st.summary()
+        self.assertEqual(sm["errorlog"]["total"], 1)                    # 7일 이전 에러 줄은 제외
+        self.assertEqual(sm["total"], 0 if sm["empty"] else sm["total"])
+
+    def test_notes_files_outside_range(self):
+        old = _write(self.tmp.name, "old.log", [line(t="01/Jul/2026:12:00:00 +0900")])
+        new = _write(self.tmp.name, "new.log", [line(ip="2.2.2.2", t="10/Oct/2026:12:00:00 +0900")])
+        sm = self.st([old, new]).summary()
+        self.assertEqual([n["type"] for n in sm["notes"]], ["warn"])
+        self.assertIn("old.log", sm["notes"][0]["text"])
+        self.assertEqual(self.st([old, new], recent_days=0).summary()["notes"], [])
+
+    def test_anchor_now_and_empty_range(self):
+        import calendar
+        lines = [line(ip="9.9.9.9", ua="sqlmap", t="01/Oct/2026:12:00:00 +0900")]
+        p = _write(self.tmp.name, "o.log", lines)
+        now = calendar.timegm((2026, 10, 20, 0, 0, 0, 0, 0, 0)) - 9 * 3600       # KST 2026-10-20 00:00
+        st = server.State(cfg(recent_anchor="now"), now_fn=lambda: now)
+        self.addCleanup(st.cleanup)
+        st.add_file("o.log", p, "o")
+        sm = st.summary()
+        self.assertTrue(sm["empty"])                                     # 현재 기준 7일 안에 로그가 없음
+        self.assertEqual((sm["range"]["from"], sm["range"]["to"], sm["range"]["excluded"]), ("2026-10-13 00:00:00", "2026-10-20 00:00:00", 1))
+        st.set_days(30)
+        self.assertFalse(st.summary()["empty"])
+
+    def test_source_files_are_kept_and_cleaned(self):
+        src = _write(self.tmp.name, "s.log", [line()])
+        st = self.st([src])
+        self.assertTrue(os.path.exists(src))                             # 호출자의 파일은 건드리지 않음
+        d = st.dir
+        self.assertTrue(d and os.path.isdir(d))
+        st.reset()
+        self.assertFalse(os.path.exists(d))
+        self.assertTrue(os.path.exists(src))
+        self.assertTrue(st.summary()["empty"])
 
 
 class ServerTest(unittest.TestCase):
@@ -415,6 +633,21 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(json.loads(self.req("GET", "/api/summary")[1])["mode"], "request")
         self.assertEqual(self.req("POST", "/api/mode?mode=bad")[0], 400)
         self.req("POST", "/api/mode?mode=auto")
+
+    def test_range_api(self):
+        self.req("POST", "/api/reset")
+        with open(os.path.join(SAMPLES, "nginx_access.log"), "rb") as f:
+            self.assertEqual(self.req("POST", "/api/upload?name=a.log", f.read())[0], 200)
+        s = json.loads(self.req("GET", "/api/summary")[1])
+        self.assertEqual(s["range"]["days"], 7)
+        self.assertEqual(self.req("POST", "/api/range?days=1")[0], 200)
+        s = json.loads(self.req("GET", "/api/summary")[1])
+        self.assertEqual(s["range"]["days"], 1)
+        self.assertIn("in_range", s["files"][0])
+        for bad in ("abc", "-1", "99999", ""):
+            self.assertEqual(self.req("POST", "/api/range?days=" + bad)[0], 400, bad)
+        self.req("POST", "/api/range?days=0")
+        self.req("POST", "/api/reset")
 
     def test_bad_file(self):
         st, data = self.req("POST", "/api/upload?name=x.log", b"hello\nworld\n")

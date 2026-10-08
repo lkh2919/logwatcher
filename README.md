@@ -11,7 +11,7 @@ nginx·HAProxy 로그를 올리면 **위협 IP를 위험도(높음·중간·낮�
 
 1. [Actions](../../actions) → 최신 실행의 **LogWatcher-windows** 아티팩트에서 `LogWatcher.exe`를 받습니다. (또는 `build.bat`으로 직접 빌드, Python 설치 시 `run_with_python.bat`로 바로 실행)
 2. `LogWatcher.exe`를 더블클릭하면 콘솔 창이 뜨고 브라우저에 화면이 열립니다. (닫으려면 콘솔 창을 닫거나 Ctrl+C)
-3. nginx `access.log`·`error.log` 또는 HAProxy 로그(여러 개, `.gz` 가능)를 화면에 끌어다 놓습니다.
+3. 로그 파일을 화면에 끌어다 놓습니다. **여러 개를 한꺼번에** 선택해도 되고(분할·회전된 `access.log.1`, `.gz` 포함), HAProxy 로그와 nginx 로그를 함께 올려도 됩니다.
 4. 맨 위 판정을 확인합니다: **✔ 이상 없음** / **⚠ 이상 징후 N IP 발견**. 행을 누르면 근거와 조치 가이드가 펼쳐집니다.
 5. `결과 CSV 저장`으로 보고용 파일(엑셀에서 한글 정상)을 받습니다.
 
@@ -23,9 +23,17 @@ nginx·HAProxy 로그를 올리면 **위협 IP를 위험도(높음·중간·낮�
 |---|---|---|
 | nginx access.log | combined(기본) 및 뒤에 필드가 붙은 `log_format`, 대괄호형(`[request "..."] [status N] [body_bytes_sent N]`), JSON 한 줄 | 마지막에 `"$http_x_forwarded_for"`가 있으면 함께 읽음 |
 | nginx error.log | `2026/10/08 10:12:01 [error] ...` | 보안 신호는 위협 IP 판정에 반영, 서버 오류는 "서버 상태"로 분리 |
-| HAProxy | `option httplog` 형식(syslog 접두 유무 모두) | **실제 접속자 IP가 바로 기록됨**. `Server ... is DOWN`, `no server available`, TLS 핸드셰이크 실패 줄도 읽음 |
+| HAProxy | `option httplog` 및 **사용자 정의 `log-format`**(syslog 접두 유무 모두) | **실제 접속자 IP가 바로 기록됨**. `Server ... is DOWN`, `no server available`, TLS 핸드셰이크 실패 줄도 읽음 |
 
+HAProxy 로그는 형식을 고정하지 않고 `접속자IP:포트`, `[접속시각]`, 따옴표로 감싼 요청줄만 찾습니다. 응답코드·바이트·종료 상태·타이머·캡처 헤더는 있으면 읽고 없어도 됩니다. 그래서 `log-format`을 바꿨거나, 앞부분을 잘라냈거나, 일부 줄을 삭제하거나, 접두(syslog 헤더)·일부 필드를 지운 로그도 읽습니다. 읽지 못한 줄은 건너뛰고 파일 목록에 `읽기 실패 N줄`로 표시합니다(숫자에 마우스를 올리면 예시 줄이 보입니다).
 HAProxy TCP 모드 로그(`option tcplog`)는 요청 URL이 없어 분석할 수 없습니다(올리면 안내 메시지가 나옵니다).
+
+## 여러 파일 · 분석 범위
+
+- **분할된 로그**: 같은 서버의 로그를 여러 파일로 나눠 올려도 하나처럼 합쳐 분석합니다. 파일마다 따로 보지 않고 전체를 합쳐서 LB/프록시 판별과 과다 접속 같은 건수 기준을 계산합니다. 내용이 완전히 같은 파일을 두 번 올리면 건너뜁니다.
+- **HAProxy + nginx 동시**: 같은 요청(같은 Method·URL, 시각 ±2초)을 하나로 합칩니다. 접속자 IP는 HAProxy 기준, User-Agent는 nginx 기준으로 가져옵니다. LB 뒤 nginx의 IP가 프록시로 인식되지 않아 합쳐지지 않으면 화면에 안내가 나오며, 그 IP를 `trusted_proxies`에 넣으면 됩니다. nginx에 **직접** 들어온 요청(HAProxy를 거치지 않은 스캐너 등)은 그대로 집계합니다.
+- **분석 범위(기본 최근 7일)**: 로그의 **마지막 시각 기준 최근 7일**만 분석하고 화면에 표시합니다. 화면의 `분석 범위`에서 1·3·7·14·30일·전체로 바로 바꿀 수 있습니다. 파일별로 범위 안/밖 줄 수가 표시되고, 범위 안에 줄이 없는 파일은 안내됩니다. 기준을 현재 시각으로 하려면 `recent_anchor`를 `now`로 바꾸세요.
+- **임시 보관**: 범위를 바꾸거나 파일을 추가할 때 다시 분석하려고 올린 파일을 이 PC의 임시 폴더에 복사해 둡니다(원본은 건드리지 않음). `전체 초기화`나 프로그램 종료 때 삭제합니다.
 
 ## LB/프록시 뒤의 로그 (IP 구분)
 
@@ -37,8 +45,7 @@ HAProxy TCP 모드 로그(`option tcplog`)는 요청 URL이 없어 분석할 수
 
 기본값은 자동 판별이며(요청의 80% 이상이 한 IP이거나 IP가 3개 이하 등), 화면의 **IP 구분** 선택으로 수동 전환할 수 있습니다.
 
-**HAProxy가 앞에 있는 경우:** HAProxy 로그를 분석하면 별도 설정 없이 실제 접속자 IP로 판정할 수 있어 가장 정확합니다. nginx 로그를 분석하려면 HAProxy에 `option forwardfor`를 켜고 nginx `log_format`에 `"$http_x_forwarded_for"`를 남기세요.
-HAProxy 로그와 nginx 접근 로그를 **함께** 올리면 같은 요청이 두 번 집계될 수 있어(과다 접속 등이 부풀려짐) 화면에 경고가 나옵니다. 한쪽만 올리세요. nginx error.log는 함께 올려도 됩니다.
+**HAProxy가 앞에 있는 경우:** HAProxy 로그를 분석하면 별도 설정 없이 실제 접속자 IP로 판정할 수 있어 가장 정확합니다. nginx 로그만 분석하려면 HAProxy에 `option forwardfor`를 켜고 nginx `log_format`에 `"$http_x_forwarded_for"`를 남기세요. 두 로그를 함께 올리면 위 "여러 파일" 설명대로 합쳐서 분석합니다.
 
 ## 탐지 항목
 
@@ -71,6 +78,8 @@ HAProxy 로그와 nginx 접근 로그를 **함께** 올리면 같은 요청이 �
 |---|---|
 | `allow_ips` | 모든 탐지에서 제외할 IP/대역(CIDR 가능). 사내 사용자, 점검 서버, 모니터링·대시보드 폴링 등 정상 대량 접속 |
 | `probe_ignore_paths` | 취약경로 탐색 규칙에서 제외할 경로 정규식. 예: `["^/graphql", "^/swagger"]` (SQLi 등 다른 공격은 계속 탐지) |
+| `recent_days` | 분석 범위(최근 N일, 기본 7, 0이면 전체). 화면에서도 바꿀 수 있음 |
+| `recent_anchor` | 범위 기준: `latest`(로그의 마지막 시각, 기본) / `now`(현재 시각) |
 | `trusted_proxies` | X-Forwarded-For를 신뢰할 프록시/CDN 대역(사설 IP는 자동 신뢰) |
 | `auto_proxy` | 공인 IP의 LB를 XFF 사용 패턴으로 자동 판단 (기본 true) |
 | `rest_methods` | 비정상 Method(중간) 대신 낮음으로 보는 Method (기본 PUT, DELETE, PATCH) |
@@ -87,6 +96,8 @@ HAProxy 로그와 nginx 접근 로그를 **함께** 올리면 같은 요청이 �
 - 해외 접속 판별(IP→국가)은 포함하지 않았습니다.
 - 인터넷에 노출된 서버는 스캐너 IP가 매우 많아 "이상 징후"가 늘 나올 수 있습니다. 높음과 `⚠ 정상 응답` 표시부터 확인하세요.
 - 사내 사용자의 정상 대량 접속(대시보드 자동 새로고침 등)은 `과다 접속`으로 나올 수 있으니 `allow_ips`로 제외하세요.
+- HAProxy와 nginx 로그의 같은 요청을 합치는 것은 Method·URL·시각(±2초)이 같은 요청을 짝짓는 방식이라, 같은 URL을 동시에 요청한 경우 드물게 어긋날 수 있습니다.
+- 로그를 잘라낸 경우 잘린 구간의 요청은 집계되지 않습니다(예: 과다 접속 건수가 실제보다 적게 나올 수 있음).
 - 로그·CSV에는 IP·사용자 ID 등 개인정보가 포함될 수 있으니 사내 지침에 따라 관리하세요.
 
 ## 개발

@@ -110,7 +110,8 @@ def write_extra(rng, users):
     with open(os.path.join(OUT, "nginx_error.log"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
     # haproxy: 접속자 IP가 바로 찍힘
-    hl = [(sec, hap(ip, sec, req, st, sz, ua)) for sec, ip, req, st, sz, ua in rows]
+    # nginx에 직접 접속한 스캐너(DIRECT)는 HAProxy를 거치지 않으므로 HAProxy 로그에는 없다
+    hl = [(sec, hap(ip, sec, req, st, sz, ua)) for sec, ip, req, st, sz, ua in rows if ip not in DIRECT]
     hl.append((20000, "Oct  8 14:33:20 localhost haproxy[589155]: 198.51.100.31:45512 [08/Oct/2026:14:33:20.135] main/1: SSL handshake failure"))
     hl.append((21000, 'Oct  8 14:50:00 localhost haproxy[589155]: Server http_back/nginx1 is DOWN, reason: Layer4 connection problem, info: "Connection refused", check duration: 0ms. 0 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.'))
     hl.append((21001, "Oct  8 14:50:00 localhost haproxy[589155]: backend http_back has no server available!"))

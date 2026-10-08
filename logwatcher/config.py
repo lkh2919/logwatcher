@@ -42,6 +42,10 @@ DEFAULTS = {
     "login_fail_min": 5,
     "login_window_sec": 600,
     "login_post_max": 20,
+    # 분석 범위: 최근 recent_days일만 분석(0이면 전체). 기준 시각은 recent_anchor:
+    #   latest = 올린 로그의 마지막 시각, now = 현재 시각
+    "recent_days": 7,
+    "recent_anchor": "latest",
     # 화면 표시 시간대(KST=9)
     "display_utc_offset_hours": 9,
     # nginx error.log 기록 시간대(시간대 표기가 없는 로그라 서버 로컬 시간 기준, KST=9)

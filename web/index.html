@@ -38,6 +38,7 @@ tr.row{cursor:pointer}tr.row:hover{background:var(--bg)}
 .muted{color:var(--sub)}
 details summary{cursor:pointer;color:var(--acc)}
 .err{color:var(--hi)}
+.info{background:var(--lob);color:var(--lo);border-radius:8px;padding:8px 12px;margin-bottom:12px}
 .ev td{font-size:12px}
 @media (max-width:700px){main{padding:8px}th:nth-child(n+5),td:nth-child(n+5){display:none}}
 </style>
@@ -48,7 +49,7 @@ details summary{cursor:pointer;color:var(--acc)}
   <div class="card">
     <div class="bar"><h2 style="margin:0">1. 로그 파일 올리기</h2><span style="flex:1"></span><button id="reset">전체 초기화</button></div>
     <div id="drop">nginx access.log 파일을 여기로 끌어다 놓거나 클릭해서 선택하세요<br>
-      <small>nginx access.log(combined·JSON·대괄호형) · nginx error.log · HAProxy 로그, .gz 지원 · 여러 파일 동시 선택 가능 · 파일은 이 PC 밖으로 전송되지 않습니다</small>
+      <small>nginx access.log(combined·JSON·대괄호형) · nginx error.log · HAProxy 로그, .gz 지원 · 분할(회전)된 로그·HAProxy와 nginx 로그를 한꺼번에 선택할 수 있습니다 · 파일은 이 PC 밖으로 전송되지 않습니다</small>
       <input id="file" type="file" multiple hidden></div>
     <div id="msg" style="margin-top:8px"></div>
     <div id="files"></div>
@@ -101,25 +102,54 @@ async function refresh() {
 
 function renderFiles() {
   const fs = SUM.files || [];
-  $("files").innerHTML = !fs.length ? "" : `<table><tr><th>파일</th><th>형식</th><th>줄 수</th><th>기간</th><th>읽기 실패</th></tr>` +
+  const hasRange = fs.some(f => f.in_range !== undefined);
+  $("files").innerHTML = !fs.length ? "" : `<table><tr><th>파일</th><th>형식</th><th>줄 수</th><th>기간</th>${hasRange ? "<th>분석 범위 내</th><th>제외·병합</th>" : ""}<th>읽기 실패</th></tr>` +
     fs.map(f => `<tr><td>${esc(f.name)}</td><td>${esc(f.format_label)}</td><td>${f.parsed.toLocaleString()}</td><td class="mono">${esc(f.first)} ~ ${esc(f.last)}</td>
+    ${hasRange ? `<td>${f.in_range === 0 ? `<span class="err">0</span>` : (f.in_range || 0).toLocaleString()}</td><td class="muted">${f.excluded ? `범위 밖 ${f.excluded.toLocaleString()}` : ""}${f.excluded && f.merged ? " · " : ""}${f.merged ? `중복 병합 ${f.merged.toLocaleString()}` : ""}</td>` : ""}
     <td${f.skipped ? ` title="${esc((f.skipped_samples||[]).join("\n"))}"` : ""}>${f.skipped ? `<span class="err">${f.skipped}줄</span>` : "-"}</td></tr>`).join("") + `</table>`;
+}
+
+function rangeSelect() {
+  const opts = [[1, "1일"], [3, "3일"], [7, "7일"], [14, "14일"], [30, "30일"], [0, "전체"]];
+  const cur = SUM.days;
+  if (!opts.some(o => o[0] === cur)) opts.splice(2, 0, [cur, cur + "일"]);
+  return `<label class="muted">분석 범위 최근 <select id="range">${opts.map(([v, t]) => `<option value="${v}"${v === cur ? " selected" : ""}>${t}</option>`).join("")}</select></label>`;
+}
+
+function rangeText() {
+  const r = SUM.range;
+  if (!r) return "";
+  const base = r.anchor === "now" ? "현재 시각" : "로그의 마지막 시각";
+  return (r.days ? `분석 범위 ${r.from} ~ ${r.to} (최근 ${r.days}일, ${base} 기준)` : `분석 범위 전체`) +
+    (r.excluded ? ` · 범위 밖 ${r.excluded.toLocaleString()}줄 제외` : "");
+}
+
+function bindRange() {
+  const sel = $("range");
+  if (sel) sel.onchange = async e => { await api("/api/range?days=" + e.target.value, {method: "POST"}); await refresh(); };
 }
 
 function renderOut() {
   const o = $("out");
-  if (SUM.empty) { o.innerHTML = ""; return; }
+  if (SUM.empty) {
+    if (!(SUM.files || []).length) { o.innerHTML = ""; return; }
+    o.innerHTML = `<div class="card"><div class="bar"><h2 style="margin:0">2. 탐지 결과</h2><span style="flex:1"></span>${rangeSelect()}</div>
+      <p class="warn">분석 범위 안에 로그가 없습니다. ${esc(rangeText())}<br>범위를 늘리거나 최근 로그를 올려주세요.</p></div>`;
+    bindRange();
+    return;
+  }
   const v = SUM.verdict, req = SUM.mode === "request";
   const notes = [];
-  (SUM.warnings || []).forEach(w => notes.push(esc(w)));
+  (SUM.notes || []).forEach(n => notes.push({cls: n.type === "warn" ? "warn" : "info", text: esc(n.text)}));
   if ((SUM.auto_proxies || []).length)
-    notes.push(`LB/프록시로 자동 판단된 IP: ${SUM.auto_proxies.map(p => `<b class="mono">${esc(p.ip)}</b>(${p.requests.toLocaleString()}건)`).join(", ")} — 이 IP가 보낸 요청은 <b>X-Forwarded-For의 실제 접속자 IP</b>로 판정했습니다. 맞지 않으면 config.json의 <span class="mono">auto_proxy</span>를 false로 바꾸세요.`);
+    notes.push({cls: "warn", text: `LB/프록시로 자동 판단된 IP: ${SUM.auto_proxies.map(p => `<b class="mono">${esc(p.ip)}</b>(${p.requests.toLocaleString()}건)`).join(", ")} — 이 IP가 보낸 요청은 <b>X-Forwarded-For의 실제 접속자 IP</b>로 판정했습니다. 맞지 않으면 config.json의 <span class="mono">auto_proxy</span>를 false로 바꾸세요.`});
   let h = `<div id="verdict" class="${v.status}">${v.status === "ok" ? "✔ " : "⚠ "}${esc(v.text)}
-    <small>분석 기간 ${esc(SUM.period[0])} ~ ${esc(SUM.period[1])} · 전체 요청 ${SUM.total.toLocaleString()}건 · 접속 IP ${SUM.unique_ips.toLocaleString()}개${SUM.xff_used ? ` · X-Forwarded-For 사용 ${SUM.xff_used.toLocaleString()}건` : ""}</small></div>`;
-  notes.forEach(n => { h += `<div class="warn">${n}</div>`; });
+    <small>${esc(rangeText())}<br>분석 기간 ${esc(SUM.period[0])} ~ ${esc(SUM.period[1])} · 전체 요청 ${SUM.total.toLocaleString()}건 · 접속 IP ${SUM.unique_ips.toLocaleString()}개${SUM.xff_used ? ` · X-Forwarded-For 사용 ${SUM.xff_used.toLocaleString()}건` : ""}</small></div>`;
+  notes.forEach(n => { h += `<div class="${n.cls}">${n.text}</div>`; });
   if (SUM.unreliable && SUM.mode_setting === "auto")
     h += `<div class="warn">IP를 구분할 수 없는 로그로 판단해 <b>요청 단위</b>로 판정했습니다. (${esc(SUM.reason)}) LB 뒤의 로그이고 X-Forwarded-For가 기록되지 않은 경우입니다. IP별 규칙(과다 접속·에러 다수·로그인 시도 등)은 적용되지 않습니다.</div>`;
   h += `<div class="card"><div class="bar"><h2 style="margin:0">2. 탐지 결과</h2><span style="flex:1"></span>
+    ${rangeSelect()}
     <label class="muted">IP 구분 <select id="mode">
       <option value="auto">자동 판별</option><option value="ip">IP별 판정</option><option value="none">IP 구분 안 함</option></select></label>
     <button class="pri" id="csv">결과 CSV 저장</button></div>`;
@@ -130,6 +160,7 @@ function renderOut() {
   $("mode").value = SUM.mode_setting;
   $("mode").onchange = async e => { await api("/api/mode?mode=" + e.target.value, {method: "POST"}); await refresh(); };
   $("csv").onclick = () => { location.href = "/api/export/result.csv"; };
+  bindRange();
   o.querySelectorAll("tr.row").forEach(tr => tr.onclick = () => toggleDetail(tr));
   const lt = $("lowtoggle"); if (lt) lt.onclick = () => { SHOW_LOW = !SHOW_LOW; renderOut(); };
 }
