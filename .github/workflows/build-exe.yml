@@ -1,0 +1,56 @@
+name: build-exe
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.8", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -t . -v
+
+  windows-exe:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pyinstaller
+      - run: python -m PyInstaller --noconfirm --clean --onefile --name LogWatcher --add-data "web;web" run.py
+      - name: Smoke test (exe starts and serves the page)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\LogWatcher.exe -ArgumentList "--no-browser" -PassThru -WindowStyle Hidden
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 1
+            try { $r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/api/status; if ($r.StatusCode -eq 200) { $ok = $true; break } } catch {}
+          }
+          Stop-Process -Id $p.Id -Force
+          if (-not $ok) { throw "exe did not respond" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LogWatcher-windows
+          path: dist/LogWatcher.exe
+      - name: Attach to release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/LogWatcher.exe --generate-notes
