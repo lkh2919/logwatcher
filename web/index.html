@@ -38,6 +38,7 @@ tr.row{cursor:pointer}tr.row:hover{background:var(--bg)}
 .muted{color:var(--sub)}
 details summary{cursor:pointer;color:var(--acc)}
 .err{color:var(--hi)}
+th.sortable{cursor:pointer;user-select:none;white-space:nowrap}th.sortable:hover{color:var(--ink)}th.on{color:var(--acc)}
 .info{background:var(--lob);color:var(--lo);border-radius:8px;padding:8px 12px;margin-bottom:12px}
 .ev td{font-size:12px}
 @media (max-width:700px){main{padding:8px}th:nth-child(n+5),td:nth-child(n+5){display:none}}
@@ -150,6 +151,8 @@ function renderOut() {
     h += `<div class="warn">IP를 구분할 수 없는 로그로 판단해 <b>요청 단위</b>로 판정했습니다. (${esc(SUM.reason)}) LB 뒤의 로그이고 X-Forwarded-For가 기록되지 않은 경우입니다. IP별 규칙(과다 접속·에러 다수·로그인 시도 등)은 적용되지 않습니다.</div>`;
   h += `<div class="card"><div class="bar"><h2 style="margin:0">2. 탐지 결과</h2><span style="flex:1"></span>
     ${rangeSelect()}
+    ${req ? "" : sortControls()}
+    <label class="muted">근거 로그 <select id="evdir"><option value="asc">시각 오래된 순</option><option value="desc">시각 최신 순</option></select></label>
     <label class="muted">IP 구분 <select id="mode">
       <option value="auto">자동 판별</option><option value="ip">IP별 판정</option><option value="none">IP 구분 안 함</option></select></label>
     <button class="pri" id="csv">결과 CSV 저장</button></div>`;
@@ -158,6 +161,15 @@ function renderOut() {
   h += renderErrorLog();
   o.innerHTML = h;
   $("mode").value = SUM.mode_setting;
+  $("evdir").value = SUM.sort.ev;
+  $("evdir").onchange = e => setSort({ev: e.target.value});
+  const sk = $("sortkey");
+  if (sk) { sk.value = SUM.sort.key; sk.onchange = e => setSort({key: e.target.value}); }
+  const sd = $("sortdir"); if (sd) sd.onclick = () => setSort({dir: SUM.sort.dir === "desc" ? "asc" : "desc"});
+  o.querySelectorAll("th.sortable").forEach(th => th.onclick = () => {
+    const k = th.dataset.key;
+    setSort(k === SUM.sort.key ? {dir: SUM.sort.dir === "desc" ? "asc" : "desc"} : {key: k});
+  });
   $("mode").onchange = async e => { await api("/api/mode?mode=" + e.target.value, {method: "POST"}); await refresh(); };
   $("csv").onclick = () => { location.href = "/api/export/result.csv"; };
   bindRange();
@@ -179,13 +191,32 @@ function renderErrorLog() {
 }
 
 let SHOW_LOW = false;
+const SORT_LABEL = {level: "위험도", last: "마지막 접근", first: "첫 접근", requests: "요청 수", ip: "IP"};
+const DIR_LABEL = {
+  last: {desc: "최신순", asc: "오래된 순"}, first: {desc: "최신순", asc: "오래된 순"},
+  requests: {desc: "많은 순", asc: "적은 순"}, level: {desc: "높은 순", asc: "낮은 순"}, ip: {desc: "큰 순", asc: "작은 순"},
+};
+function sortControls() {
+  const s = SUM.sort, dl = DIR_LABEL[s.key][s.dir];
+  return `<label class="muted">정렬 <select id="sortkey">${Object.entries(SORT_LABEL).map(([k, t]) => `<option value="${k}">${t}</option>`).join("")}</select></label>
+    <button id="sortdir" title="정렬 방향 바꾸기">${s.dir === "desc" ? "▼" : "▲"} ${dl}</button>`;
+}
+function sortTh(key, text) {
+  const s = SUM.sort, on = s.key === key;
+  return `<th class="sortable${on ? " on" : ""}" data-key="${key}" title="눌러서 정렬 (다시 누르면 방향 반대)">${text}${on ? (s.dir === "desc" ? " ▼" : " ▲") : ""}</th>`;
+}
+async function setSort(p) {
+  const q = new URLSearchParams(p).toString();
+  await api("/api/sort?" + q, {method: "POST"});
+  await refresh();
+}
 function renderIps() {
   if (!SUM.ips.length) return `<p class="muted">탐지된 IP가 없습니다.</p>`;
   const lowN = SUM.ips.filter(x => x.level === 1).length;
   const rows = SUM.ips.filter(x => SHOW_LOW || x.level > 1);
   let h = lowN ? `<div class="bar muted">${SHOW_LOW ? "낮음 포함 전체" : "높음·중간만 표시"} (${rows.length}개) · 낮음(참고) ${lowN}개 <button id="lowtoggle">${SHOW_LOW ? "낮음 숨기기" : "낮음도 보기"}</button></div>` : "";
   if (!rows.length) return h + `<p class="muted">높음·중간으로 탐지된 IP가 없습니다.</p>`;
-  return h + `<table><tr><th>위험도</th><th>IP</th><th>요청 수</th><th>탐지 내용</th><th>접근 기간</th></tr>` +
+  return h + `<table><tr>${sortTh("level", "위험도")}${sortTh("ip", "IP")}${sortTh("requests", "요청 수")}<th>탐지 내용</th>${sortTh("last", "접근 기간(마지막 접근순)")}</tr>` +
     rows.map(x => `<tr class="row" data-ip="${esc(x.ip)}"><td>${badge(x.level)}</td><td class="mono">${esc(x.ip)}</td><td>${x.requests ? x.requests.toLocaleString() : "-"}</td>
       <td>${x.is_proxy ? `<span class="chip" title="LB/프록시 자체의 요청이라 실제 접속자 IP를 알 수 없습니다">LB/프록시</span>` : ""}${x.findings.map(f => `<span class="chip l${f.level}">${esc(f.label)}</span>`).join("")}${x.success_warn ? ` <span class="sw" title="공격 요청이 2xx 정상 응답을 받았습니다">⚠ 정상 응답</span>` : ""}</td>
       <td class="mono">${esc(x.first)}<br>~ ${esc(x.last)}</td></tr>`).join("") + `</table>`;
@@ -207,7 +238,7 @@ function findingHtml(f) {
   if (g.actions) h += `<div class="k">조치 가이드</div><ul>${g.actions.map(c => `<li>${esc(c)}</li>`).join("")}</ul>`;
   if (g.false_positive) h += `<div class="k">오탐 가능성</div><p>${esc(g.false_positive)}</p>`;
   if (f.evidence && f.evidence.length)
-    h += `<div class="k">근거 로그 (최대 ${f.evidence.length}건)</div><table class="ev"><tr><th>시각</th><th>IP</th><th>Method</th><th>URL</th><th>코드</th></tr>` +
+    h += `<div class="k">근거 로그 (${f.evidence_total > f.evidence.length ? `전체 ${f.evidence_total.toLocaleString()}건 중 가장 이른 것·최근 것 ${f.evidence.length}건` : `${f.evidence.length}건`} · 시각 ${SUM.sort.ev === "desc" ? "최신 순" : "오래된 순"})</div><table class="ev"><tr><th>시각</th><th>IP</th><th>Method</th><th>URL</th><th>코드</th></tr>` +
       f.evidence.map(e => `<tr><td class="mono">${esc(e.time)}</td><td class="mono">${esc(e.ip)}</td><td>${esc(e.method)}</td><td class="mono">${esc(e.url)}</td><td>${e.status || "-"}</td></tr>`).join("") + `</table>`;
   return h + `</div>`;
 }
