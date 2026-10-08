@@ -7,8 +7,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+# 기본 권한은 읽기 전용: 테스트·빌드는 저장소를 바꿀 수 없다. 릴리스 작업만 아래에서 쓰기 권한을 따로 받는다.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -31,32 +32,58 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install pyinstaller
+      # 빌드 도구 버전을 고정한다(같은 소스는 같은 도구로 빌드)
+      - run: python -m pip install pyinstaller==6.22.3
       - run: python -m PyInstaller --noconfirm --clean --onefile --name LogWatcher --add-data "web;web" --add-data "data;data" run.py
-      - name: Smoke test (exe starts and serves the page)
+      - name: Smoke test (exe starts, requires the access token, bundles the country data)
         shell: pwsh
         run: |
+          $env:LOGWATCHER_TOKEN = "smoke-test-token-1234567890"
           $p = Start-Process -FilePath dist\LogWatcher.exe -ArgumentList "--no-browser" -PassThru -WindowStyle Hidden
+          $h = @{ "X-LW-Token" = $env:LOGWATCHER_TOKEN }
           $ok = $false
+          $fail = $null
           foreach ($i in 1..30) {
             Start-Sleep -Seconds 1
             try {
-              $r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/api/status
+              $r = Invoke-WebRequest -UseBasicParsing -SkipHttpErrorCheck -Headers $h http://127.0.0.1:8765/api/status
               if ($r.StatusCode -eq 200) {
-                if (-not (($r.Content | ConvertFrom-Json).geo.available)) { Stop-Process -Id $p.Id -Force; throw "geo data is not bundled in the exe" }
-                $ok = $true; break
+                $ok = $true
+                $noauth = Invoke-WebRequest -UseBasicParsing -SkipHttpErrorCheck http://127.0.0.1:8765/api/status
+                if ($noauth.StatusCode -ne 401) { $fail = "API answered without the access token: $($noauth.StatusCode)" }
+                elseif (-not (($r.Content | ConvertFrom-Json).geo.available)) { $fail = "geo data is not bundled in the exe" }
+                break
               }
-            } catch { if ($_.Exception.Message -like "geo data*") { throw } }
+            } catch { }
           }
           Stop-Process -Id $p.Id -Force
           if (-not $ok) { throw "exe did not respond" }
+          if ($fail) { throw $fail }
+      - name: SHA-256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist\LogWatcher.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  LogWatcher.exe" | Out-File -Encoding ascii dist\LogWatcher.exe.sha256
+          Get-Content dist\LogWatcher.exe.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: LogWatcher-windows
-          path: dist/LogWatcher.exe
-      - name: Attach to release (tag builds)
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
+          path: |
+            dist/LogWatcher.exe
+            dist/LogWatcher.exe.sha256
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows-exe
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: LogWatcher-windows
+          path: dist
+      - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/LogWatcher.exe --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/LogWatcher.exe dist/LogWatcher.exe.sha256 --repo "$GITHUB_REPOSITORY" --generate-notes

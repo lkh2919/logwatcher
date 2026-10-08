@@ -3,9 +3,11 @@ import atexit
 import csv
 import hashlib
 import io
+import hmac
 import ipaddress
 import json
 import os
+import secrets
 import shutil
 import tempfile
 import threading
@@ -21,6 +23,18 @@ from .detector import LEVEL_LABEL, fmt_ts
 from .geoip import load_geo
 from .parser import LogReader
 from .resources import resource_path
+
+TOKEN_HEADER = "X-LW-Token"
+# 브라우저가 이 페이지에서 외부 주소로 요청을 보내거나 다른 페이지가 이 화면을 프레임에 넣지 못하게 한다(심층 방어)
+SECURITY_HEADERS = {
+    "Content-Security-Policy": ("default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Cross-Origin-Opener-Policy": "same-origin",
+}
+TOKEN = None        # 실행할 때마다 새로 만든 접근 토큰: make_server가 정한다
 
 MODES = ("auto", "ip", "none")
 # 최근 분석 결과를 보관해 범위를 되돌릴 때 다시 계산하지 않는다. 메모리를 아끼려고 IP가 많으면 적게 보관한다.
@@ -311,6 +325,11 @@ class Handler(BaseHTTPRequestHandler):
                 return False
         return True
 
+    def _authed(self):
+        """같은 PC의 다른 사용자·다른 프로그램이 이 서버를 쓰지 못하도록 실행마다 새로 만든 토큰을 요구한다."""
+        got = self.headers.get(TOKEN_HEADER) or ""
+        return bool(TOKEN) and hmac.compare_digest(got.encode("utf-8", "replace"), TOKEN.encode("utf-8"))
+
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -321,6 +340,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -335,11 +356,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, {"error": "forbidden"})
         path, q = self._query()
         try:
-            if path in ("/", "/index.html"):
+            if path in ("/", "/index.html"):          # 화면 파일 자체에는 데이터가 없어 토큰 없이 연다
                 with open(resource_path("web", "index.html"), "rb") as f:
                     return self._send(200, f.read(), "text/html; charset=utf-8")
             if path == "/favicon.ico":
                 return self._send(204, b"", "image/x-icon")
+            if not self._authed():
+                return self._send(401, {"error": "unauthorized"})
             if path == "/api/status":
                 geo = load_geo(STATE.cfg)
                 return self._send(200, {"version": VERSION, "config": STATE.cfg, "geo": {"available": geo.available, "source": geo.source}, "level_guide": guide.LEVEL_GUIDE,
@@ -362,6 +385,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._allowed():
             return self._send(403, {"error": "forbidden"})
+        if not self._authed():
+            return self._send(401, {"error": "unauthorized"})
         path, q = self._query()
         try:
             if path == "/api/upload":
@@ -410,13 +435,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(port_candidates, cfg=None):
-    global STATE
+    global STATE, TOKEN
     STATE = State(cfg)
+    TOKEN = os.environ.get("LOGWATCHER_TOKEN") or secrets.token_urlsafe(24)   # 환경변수는 자동화·점검용
     atexit.register(STATE.cleanup)
     last = None
     for p in port_candidates:
         try:
-            return ThreadingHTTPServer(("127.0.0.1", p), Handler)
+            httpd = ThreadingHTTPServer(("127.0.0.1", p), Handler)
+            httpd.token = TOKEN
+            return httpd
         except OSError as e:
             last = e
     raise last
