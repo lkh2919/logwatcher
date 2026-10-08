@@ -1,9 +1,11 @@
 """PC 내부 전용(127.0.0.1) 웹 서버. 업로드된 로그는 PC 안에서만 처리하고 외부로 전송하지 않는다."""
+import atexit
 import csv
 import hashlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -12,7 +14,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from . import VERSION, guide
 from . import config as config_mod
-from .detector import LEVEL_LABEL, Analyzer, fmt_ts
+from .analysis import analyze
+from .detector import LEVEL_LABEL, fmt_ts
 from .parser import LogReader
 from .resources import resource_path
 
@@ -27,56 +30,77 @@ def csv_safe(v):
 
 
 class State:
-    def __init__(self, cfg=None):
+    """올린 파일을 세션 임시 폴더에 보관하고, 요청이 있을 때 전체를 합쳐 분석한다.
+
+    분할 로그, HAProxy+nginx 동시 사용, 분석 범위(최근 N일) 변경을 위해 원본을 다시 읽는다.
+    임시 폴더는 [전체 초기화]나 프로그램 종료 때 삭제한다.
+    """
+
+    def __init__(self, cfg=None, now_fn=time.time):
         self.lock = threading.RLock()
         self.cfg = cfg if cfg is not None else config_mod.load()
         self.mode = self.cfg["ip_mode"] if self.cfg["ip_mode"] in MODES else "auto"
+        self.days = max(0, int(self.cfg["recent_days"]))
+        self.anchor = self.cfg["recent_anchor"] if self.cfg["recent_anchor"] in ("latest", "now") else "latest"
+        self.now_fn = now_fn
+        self.dir = None
         self.reset()
 
+    # ------------------------------------------------------------ 파일 관리
     def reset(self):
         with self.lock:
-            self.analyzer = Analyzer(self.cfg)
-            self.files = []
-            self.formats = set()
+            self.cleanup()
+            self.entries = []
             self.hashes = set()
+            self._analysis = None
             self._result = None
+
+    def cleanup(self):
+        d, self.dir = self.dir, None
+        if d:
+            shutil.rmtree(d, ignore_errors=True)
 
     def add_file(self, name, tmp_path, digest):
         with self.lock:
             if digest in self.hashes:
                 return {"name": name, "error": "이미 추가된 파일과 내용이 같아서 건너뛰었습니다."}
+            if self.dir is None:
+                self.dir = tempfile.mkdtemp(prefix="logwatcher_")
+            dest = os.path.join(self.dir, "%04d.log" % (len(self.entries) + 1))
+            shutil.copyfile(tmp_path, dest)      # 호출자의 파일은 건드리지 않는다(업로드 임시 파일은 호출자가 지움)
             try:
-                reader = LogReader(tmp_path, self.cfg["display_utc_offset_hours"],
+                reader = LogReader(dest, self.cfg["display_utc_offset_hours"],
                                    self.cfg["error_log_utc_offset_hours"], self.cfg["haproxy_log_utc_offset_hours"])
+                proxies = reader.scan()          # 형식 판별 후 한 번 훑어 기간·LB 후보를 구함
             except ValueError as e:
+                os.remove(dest)
                 return {"name": name, "error": str(e)}
-            a = self.analyzer
-            if reader.kind == "access":
-                a.register_proxies(reader.scan_proxies())   # LB/프록시 자동 판별(파일을 한 번 더 훑음)
-
-                def feed(rec):      # HAProxy 로그의 상태 줄은 에러로그 형식(길이 6)으로 온다
-                    a.feed_error(rec) if len(rec) == 6 else a.feed(rec)
-            else:
-                feed = a.feed_error
-            for rec in reader.records():
-                feed(rec)
-            i = reader.info
-            if i["parsed"] == 0:
+            info = dict(reader.info)
+            if info["parsed"] == 0:
+                os.remove(dest)
                 return {"name": name, "error": "읽을 수 있는 로그 줄이 없습니다. 형식을 확인하세요."}
             self.hashes.add(digest)
-            self.formats.add(i["format"])
-            self._result = None
-            view = {"name": name, "format_label": i["format_label"], "lines": i["lines"], "parsed": i["parsed"],
-                    "skipped": i["skipped"], "skipped_samples": i["skipped_samples"],
-                    "first": fmt_ts(i["first"]), "last": fmt_ts(i["last"])}
-            self.files.append(view)
-            return view
+            self.entries.append({"name": name, "reader": reader, "kind": reader.kind, "fmt": reader.fmt,
+                                 "proxies": proxies, "info": info})
+            self._analysis = self._result = None
+            return self._file_view(len(self.entries) - 1)
 
-    def result(self):
+    def _file_view(self, i):
+        e = self.entries[i]
+        info = e["info"]
+        v = {"name": e["name"], "format_label": info["format_label"], "lines": info["lines"], "parsed": info["parsed"],
+             "skipped": info["skipped"], "skipped_samples": info["skipped_samples"],
+             "first": fmt_ts(info["first"]), "last": fmt_ts(info["last"])}
+        if self._analysis is not None:
+            v.update(self._analysis["per_file"][i])
+        return v
+
+    # ------------------------------------------------------------ 분석
+    def analysis(self):
         with self.lock:
-            if self._result is None:
-                self._result = self.analyzer.result(self.mode)
-            return self._result
+            if self._analysis is None and self.entries:
+                self._analysis = analyze(self.entries, self.cfg, self.days, self.anchor, self.now_fn())
+            return self._analysis
 
     def set_mode(self, mode):
         with self.lock:
@@ -85,30 +109,46 @@ class State:
             self.mode = mode
             self._result = None
 
+    def set_days(self, days):
+        with self.lock:
+            if not 0 <= days <= 3650:
+                raise ValueError("bad days")
+            self.days = days
+            self._analysis = self._result = None
+
+    def result(self):
+        with self.lock:
+            an = self.analysis()
+            if self._result is None and an is not None:
+                self._result = an["analyzer"].result(self.mode)
+            return self._result
+
+    def _range(self, an):
+        return {"days": self.days, "anchor": self.anchor, "from": fmt_ts(an["cutoff"]) if an["cutoff"] is not None else "",
+                "to": fmt_ts(an["anchor"]), "excluded": an["excluded"], "in_range": an["in_range"]}
+
     def summary(self):
         with self.lock:
-            if not (self.analyzer.total or self.analyzer.err_total):
-                return {"files": self.files, "empty": True, "mode_setting": self.mode}
+            an = self.analysis()
+            if an is None:
+                return {"files": [], "empty": True, "mode_setting": self.mode, "days": self.days}
+            files = [self._file_view(i) for i in range(len(self.entries))]
+            a = an["analyzer"]
+            if not (a.total or a.err_total):          # 분석 범위 안에 로그가 없음
+                return {"files": files, "empty": True, "mode_setting": self.mode, "days": self.days,
+                        "range": self._range(an), "notes": an["notes"]}
             res = self.result()
-            a = self.analyzer
             return {
-                "files": self.files, "empty": False, "total": a.total, "allowed_skipped": a.allowed_skipped,
+                "files": files, "empty": False, "total": a.total, "allowed_skipped": a.allowed_skipped,
                 "unique_ips": res["distinct_ips"], "xff_used": res["xff_used"],
-                "period": [fmt_ts(a.first_ts), fmt_ts(a.last_ts)],
-                "auto_proxies": res["auto_proxies"], "errorlog": res["errorlog"], "warnings": self._warnings(),
+                "period": [fmt_ts(a.first_ts), fmt_ts(a.last_ts)], "range": self._range(an), "days": self.days,
+                "auto_proxies": res["auto_proxies"], "errorlog": res["errorlog"], "notes": an["notes"],
                 "mode": res["mode"], "mode_setting": self.mode, "unreliable": res["unreliable"],
                 "reason": res["reason"], "verdict": res["verdict"],
                 # 목록에는 근거 로그를 싣지 않는다(상세 조회 때만). 요청 단위 모드는 항목 수가 적어 포함.
                 "ips": [self._ip_row(x) for x in res["ips"]],
                 "findings": res["findings"],
             }
-
-    def _warnings(self):
-        w = []
-        if "haproxy" in self.formats and self.formats - {"haproxy", "nginx_error"}:
-            w.append("HAProxy 로그와 nginx 접근 로그가 함께 올라와 같은 요청이 두 번 집계될 수 있습니다. "
-                     "건수 기준 탐지(과다 접속, 에러 다수 등)가 부풀려질 수 있으니 한쪽만 올리는 것을 권합니다.")
-        return w
 
     @staticmethod
     def _ip_row(x):
@@ -120,13 +160,14 @@ class State:
 
     def ip_detail(self, ip):
         with self.lock:
-            if not (self.analyzer.total or self.analyzer.err_total):
+            res = self.result()
+            if res is None:
                 return None
-            return next((x for x in self.result()["ips"] if x["ip"] == ip), None)
+            return next((x for x in res["ips"] if x["ip"] == ip), None)
 
     def result_csv(self):
         with self.lock:
-            res = self.result()
+            res = self.result() or {"mode": "ip", "ips": [], "findings": []}
             buf = io.StringIO()
             w = csv.writer(buf)
             if res["mode"] == "ip":
@@ -226,6 +267,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/mode":
                 STATE.set_mode(q.get("mode", ""))
                 return self._send(200, {"ok": True})
+            if path == "/api/range":
+                try:
+                    STATE.set_days(int(q.get("days", "")))
+                except (TypeError, ValueError):
+                    raise ValueError("bad days")
+                return self._send(200, {"ok": True})
             return self._send(404, {"error": "not found"})
         except ValueError as e:
             return self._send(400, {"error": str(e)})
@@ -257,6 +304,7 @@ class Handler(BaseHTTPRequestHandler):
 def make_server(port_candidates, cfg=None):
     global STATE
     STATE = State(cfg)
+    atexit.register(STATE.cleanup)
     last = None
     for p in port_candidates:
         try:

@@ -161,7 +161,7 @@ PROTO_HINTS = [
     ("JDWP-Handshake", "JDWP(Java 디버그)"), ("JRMI", "Java RMI"), ("SMBr", "SMB"), ("\\xffSMB", "SMB"),
     ("admin.$cmd", "MongoDB"), ("MGLNDD", "포트스캔(MGLNDD)"), ("\\x16\\x03", "TLS(HTTPS)"),
     ("*1", "Redis"), ("*2", "Redis"), ("*3", "Redis"), ("SSH-", "SSH"), ("\\x03\\x00\\x00", "RDP"),
-    ("CONNECT", "프록시 터널(CONNECT)"), ("\\x00\\x00\\x00", "바이너리 프로토콜"),
+    ("<BADREQ>", "HAProxy가 거부한 잘못된 요청"), ("CONNECT", "프록시 터널(CONNECT)"),("\\x00\\x00\\x00", "바이너리 프로토콜"),
 ]
 
 # nginx error.log 분류: (key, 정규식, 종류, 표시 이름, 설명, 조치)
@@ -173,6 +173,8 @@ ERR_RULES = [
     ("hap_up", r"Server \S+ is UP", "ops", "백엔드 서버 복구(HAProxy)", "상태 점검이 통과해 백엔드 서버가 다시 투입됐습니다.", ""),
     ("hap_stop", r"Proxy \S+ .*(stopped|started)|^Stopping|^Pausing", "ops", "HAProxy 프록시 시작/중지",
      "HAProxy가 재시작되거나 중지됐습니다. reload 중이면 정상이지만, 예정에 없던 중지라면 확인이 필요합니다.", "작업 이력(설정 변경, 배포)과 맞는지 확인하세요."),
+    ("hap_tls_idle", r"(Connection closed|Timeout) during SSL handshake \(HAProxy\)", "noise",
+     "TLS 연결 중단·타임아웃(정상 범주)", "", ""),
     ("hap_ssl", r"SSL handshake failure \(HAProxy\)", "sec", "TLS 핸드셰이크 실패(HAProxy)", "", ""),
     ("closed", r"closed connection while waiting for request|closed keepalive connection|prematurely closed connection|"
                r"client timed out|recv\(\) failed \(10[04]|epoll_wait\(\) reported that client prematurely",

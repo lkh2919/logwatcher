@@ -43,16 +43,17 @@ _NGINX_RE = re.compile(
 _BRACKET_RE = re.compile(
     r'^(\S+) \S+ (\S+) \[([^\]]+)\] \[request ' + _Q + r'\] \[status (\d{3})\] \[body_bytes_sent (\d+)\]'
     r'(?: ' + _Q + ' ' + _Q + r')?(.*)$')
-_HAP_PREFIX = (r'^(?:<\d+>)?(?:[A-Z][a-z]{2} +\d+ \d\d:\d\d:\d\d |\d{4}-\d\d-\d\d[T ]\S+ )?'
-               r'(?:\S+ )?(?:\S+\[\d+\]: )?')
-_HAP_HEAD = r'(\S+) \[(\d{2}/[A-Za-z]{3}/\d{4}:\d\d:\d\d:\d\d)(?:\.\d+)?\] (\S+) (\S+) '
-_HAP_RE = re.compile(
-    _HAP_PREFIX + _HAP_HEAD + r'[+-]?\d+/[+-]?\d+/[+-]?\d+/[+-]?\d+/[+-]?\d+ (-?\d+) \+?(\d+) \S+ \S+ \S{4} '
-    r'\d+/\d+/\d+/\d+/\+?\d+ \d+/\d+(?: \{([^}]*)\})?(?: \{[^}]*\})? "(.*)"\s*$')
-# option httplog가 아닌 tcplog: 요청 URL이 없어 분석할 수 없다
-_HAP_TCP_RE = re.compile(_HAP_PREFIX + _HAP_HEAD + r'[+-]?\d+/[+-]?\d+/[+-]?\d+ \d+ \S{4} ')
-# 접속 로그가 아닌 HAProxy 상태 줄: TLS 핸드셰이크 실패(접속 IP 있음), 서버 다운/복구, 프록시 시작·중지
-_HAP_SSL_RE = re.compile(_HAP_PREFIX + _HAP_HEAD.split(r'(\S+) \[')[0] + r'(\S+) \[(\d{2}/[A-Za-z]{3}/\d{4}:\d\d:\d\d:\d\d)(?:\.\d+)?\] (\S+) SSL handshake failure')
+# HAProxy는 log-format을 바꾸거나 로그 일부를 잘라 쓰는 경우가 많아, 고정된 전체 형식 대신 필수 요소만 찾는다:
+#   접속자 `IP:포트` + `[접속시각]` + 따옴표로 둘러싼 요청줄. 응답코드·바이트는 있으면 읽는다.
+_HAP_DATE_RE = re.compile(r'\[(\d{2}/[A-Za-z]{3}/\d{4}:\d\d:\d\d:\d\d)(?:\.\d+)?\]')
+_HAP_CLIENT_RE = re.compile(r'^\[?([0-9A-Fa-f.:]+?)\]?:(\d{1,5})$')
+_HAP_REQ_RE = re.compile(r'"((?:[A-Z]{3,10} \S+(?: HTTP/\d(?:\.\d)?)?)|<[A-Z]+>)"')
+_HAP_STATUS_RE = re.compile(r'(?:^|\s)[+-]?\d+(?:/[+-]?\d+){2,4}\s+(-?\d{1,3})\s+\+?(\d+)(?=\s|$)')
+_HAP_STATUS_FALLBACK_RE = re.compile(r'(?:^|\s)(\d{3})\s+\+?(\d+)(?=\s|$)')
+# option tcplog: 요청 URL이 없다. 타이머 3개 + 바이트
+_HAP_TCP_RE = re.compile(r'\[\d{2}/[A-Za-z]{3}/\d{4}:[\d:.]+\]\s+\S+\s+\S+\s+[+-]?\d+/[+-]?\d+/[+-]?\d+\s+\d+\s')
+# 접속 로그가 아닌 HAProxy 줄: TLS 실패(접속 IP 있음), 서버 다운/복구, 프록시 시작·중지
+_HAP_SSL_RE = re.compile(r'^\s*\S+\s+(SSL handshake failure|Connection closed during SSL handshake|Timeout during SSL handshake)')
 _HAP_EVT_RE = re.compile(r'^(?:<\d+>)?([A-Z][a-z]{2}) +(\d+) (\d\d):(\d\d):(\d\d) (?:\S+ )?\S+\[\d+\]: '
                          r'((?:Server \S+ is (?:DOWN|UP)|backend \S+ has no server available|Proxy \S+ (?:stopped|started)|Stopping|Pausing|Proxy \S+ .*stopped).*)$')
 _HAP_UA_RE = re.compile(r'Mozilla|curl/|python|Go-http|okhttp|[Bb]ot\b|[Ss]pider|[Ss]canner|/\d')
@@ -121,17 +122,29 @@ class LineParser:
             return self._haproxy(line)
         return self._nginx(line)
 
-    def _haproxy_event(self, line):
+    def _haproxy_split(self, line):
+        """(접속자 IP, 접속 시각 문자열, 날짜 뒤 나머지) 또는 None."""
+        m = _HAP_DATE_RE.search(line)
+        if not m:
+            return None
+        head = line[:m.start()].split()
+        cm = _HAP_CLIENT_RE.match(head[-1]) if head else None
+        if not cm:
+            return None
+        return cm.group(1), m.group(1), line[m.end():]
+
+    def _haproxy_event(self, line, parts=None):
         """접속 로그가 아닌 상태 줄을 에러로그 형식 레코드(길이 6)로 바꾼다."""
-        m = _HAP_SSL_RE.match(line)
-        if m:
-            cp, date, fe = m.group(1), m.group(2), m.group(3)
-            ip = cp.rsplit(":", 1)[0].strip("[]") if ":" in cp else cp
-            try:
-                ts = _parse_clf_time(date + " +0000") + self.hap_shift
-            except (KeyError, ValueError, IndexError):
-                return None
-            return (ts, "warn", ip, "SSL handshake failure (HAProxy)", "", fe)
+        parts = parts or self._haproxy_split(line)
+        if parts:
+            ip, date, rest = parts
+            m = _HAP_SSL_RE.match(rest)
+            if m:
+                try:
+                    ts = _parse_clf_time(date + " +0000") + self.hap_shift
+                except (KeyError, ValueError, IndexError):
+                    return None
+                return (ts, "warn", ip, m.group(1) + " (HAProxy)", "", "")
         m = _HAP_EVT_RE.match(line)
         if not m:
             return None
@@ -149,26 +162,36 @@ class LineParser:
         return (ts, level, "", msg[:300], "", "")
 
     def _haproxy(self, line):
-        m = _HAP_RE.match(line)
-        if not m:
+        parts = self._haproxy_split(line)
+        if parts is None:
             return self._haproxy_event(line)
-        cp, date, _fe, _be, status, size, hdrs, req = m.groups()
-        self._hap_ym = (int(date[7:11]), _MONTHS.get(date[3:6], 1))
-        ip = cp.rsplit(":", 1)[0].strip("[]") if ":" in cp else cp
+        ip, date, rest = parts
+        rm = _HAP_REQ_RE.search(rest)
+        if rm is None:
+            return self._haproxy_event(line, parts)
+        sm = _HAP_STATUS_RE.search(rest[:rm.start()]) or _HAP_STATUS_FALLBACK_RE.search(rest[:rm.start()])
+        status, size = (int(sm.group(1)), int(sm.group(2))) if sm else (0, 0)
         try:
+            self._hap_ym = (int(date[7:11]), _MONTHS[date[3:6]])
             # 접속 시각에는 시간대 표기가 없다: HAProxy 서버의 로컬 시간(haproxy_log_utc_offset_hours)
             ts = _parse_clf_time(date + " +0000") + self.hap_shift
         except (KeyError, ValueError, IndexError):
             return None
+        req = rm.group(1)
+        hdrs = ""
+        hm = re.search(r"\{([^}]*)\}", rest[:rm.start()])     # 캡처한 요청 헤더(있을 때): Host|User-Agent 등
+        if hm:
+            hdrs = hm.group(1)
         ua = ""
-        if hdrs:
-            for h in hdrs.split("|"):
-                if _HAP_UA_RE.search(h):
-                    ua = h
-                    break
-        method, path, query = _split_request(req)
-        st = int(status)
-        return (ts, _intern(ip), method, path, query, st if st > 0 else 0, int(size), _intern(ua), "", "", "")
+        for h in hdrs.split("|") if hdrs else ():
+            if _HAP_UA_RE.search(h):
+                ua = h
+                break
+        if req == "<BADREQ>" and status == 408:
+            method, path, query = "-", "", ""       # 연결만 하고 요청을 보내지 않아 타임아웃: 위협 아님
+        else:
+            method, path, query = _split_request(req)
+        return (ts, _intern(ip), method, path, query, status if status > 0 else 0, size, _intern(ua), "", "", "")
 
     def _error(self, line):
         m = _ERR_RE.match(line)
@@ -272,26 +295,46 @@ def open_text(path):
     return gzip.open(path, "rb") if magic == b"\x1f\x8b" else open(path, "rb")
 
 
+def _count_matches(lines):
+    """형식별로 몇 줄이 맞는지 센다."""
+    hp = LineParser(FMT_HAPROXY)
+    js = LineParser(FMT_JSON)
+    c = {FMT_ERROR: 0, FMT_HAPROXY: 0, FMT_JSON: 0, FMT_NGINX_BR: 0, FMT_NGINX: 0, "haproxy_tcp": 0}
+    for l in lines:
+        if _ERR_RE.match(l):
+            c[FMT_ERROR] += 1
+        elif l.lstrip().startswith("{"):
+            c[FMT_JSON] += js.parse(l) is not None
+        elif _BRACKET_RE.match(l):
+            c[FMT_NGINX_BR] += 1
+        elif _NGINX_RE.match(l):
+            c[FMT_NGINX] += 1
+        else:
+            r = hp.parse(l)
+            if r is not None and len(r) == 11:
+                c[FMT_HAPROXY] += 1
+            elif r is None and _HAP_TCP_RE.search(l):
+                c["haproxy_tcp"] += 1
+    return c
+
+
 def detect_format(sample_lines):
-    """파일 앞부분 줄들로 형식을 판별한다. 지원하지 않으면 ValueError."""
-    lines = [l for l in sample_lines if l.strip()][:50]
+    """파일 앞부분 줄들로 형식을 판별한다. 지원하지 않으면 ValueError.
+
+    일부를 잘라낸 로그도 읽을 수 있도록, 앞부분의 절반이 아니라 '가장 많이 맞는 형식'을
+    (전체의 20% 이상일 때) 고른다. 상태 줄이나 깨진 줄이 섞여 있어도 판별된다.
+    """
+    lines = [l for l in sample_lines if l.strip()][:300]
     if not lines:
         raise ValueError("빈 파일입니다.")
-    half = max(1, len(lines) // 2)
-    if sum(1 for l in lines if _ERR_RE.match(l)) >= half:
-        return FMT_ERROR
-    if sum(1 for l in lines if _HAP_RE.match(l)) >= half:
-        return FMT_HAPROXY
-    if sum(1 for l in lines if _HAP_TCP_RE.match(l)) >= half:
+    c = _count_matches(lines)
+    best = max((FMT_ERROR, FMT_HAPROXY, FMT_JSON, FMT_NGINX_BR, FMT_NGINX), key=lambda k: c[k])
+    if c[best] >= max(1, len(lines) // 5):
+        return best
+    if c["haproxy_tcp"]:
         raise ValueError("HAProxy TCP 모드 로그는 요청 URL이 없어 분석할 수 없습니다. HTTP 모드(option httplog) 로그를 올려주세요.")
-    if sum(1 for l in lines if l.lstrip().startswith("{")) >= half:
-        if sum(1 for l in lines if LineParser(FMT_JSON).parse(l) is not None) >= half:
-            return FMT_JSON
-    elif sum(1 for l in lines if _BRACKET_RE.match(l)) >= half:
-        return FMT_NGINX_BR
-    elif sum(1 for l in lines if _NGINX_RE.match(l)) >= half:
-        return FMT_NGINX
-    raise ValueError("지원하지 않는 로그 형식입니다 (nginx 접근로그[combined·대괄호형·JSON], nginx error.log, HAProxy HTTP 로그만 지원).")
+    raise ValueError("지원하지 않는 로그 형식입니다 (nginx 접근로그[combined·대괄호형·JSON], nginx error.log, HAProxy HTTP 로그만 지원). "
+                     "첫 줄: " + lines[0][:120])
 
 
 class LogReader:
@@ -308,32 +351,30 @@ class LogReader:
             head = []
             for raw in f:
                 head.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
-                if len(head) >= 50:
+                if len(head) >= 300:
                     break
         self.fmt = detect_format(head)
         self.kind = "error" if self.fmt == FMT_ERROR else "access"
         self.info["format"] = self.fmt
         self.info["format_label"] = FORMAT_LABEL[self.fmt]
 
-    def scan_proxies(self):
-        """접근 로그를 훑어 접속 IP별 (요청 수, XFF 포함 수, XFF 값 종류)를 센다. LB/프록시 자동 판별용."""
+    def scan(self):
+        """파일을 한 번 훑어 기간·줄 수(info)와 접속 IP별 (요청 수, XFF 포함 수, XFF 값 종류)를 구한다.
+
+        뒤의 값은 LB/프록시 자동 판별에 쓴다(접근 로그만).
+        """
         stats = {}
-        if self.kind != "access":
-            return stats
-        lp = LineParser(self.fmt, self.offset)
-        with open_text(self.path) as f:
-            for raw in f:
-                r = lp.parse(raw.decode("utf-8", "replace").rstrip("\r\n"))
-                if r is None or len(r) != 11:
-                    continue
-                st = stats.get(r[IP])
-                if st is None:
-                    st = stats[r[IP]] = [0, 0, set()]
-                st[0] += 1
-                if r[XFF]:
-                    st[1] += 1
-                    if len(st[2]) < 5:
-                        st[2].add(r[XFF])
+        for r in self.records():
+            if self.kind != "access" or len(r) != 11:
+                continue
+            st = stats.get(r[IP])
+            if st is None:
+                st = stats[r[IP]] = [0, 0, set()]
+            st[0] += 1
+            if r[XFF]:
+                st[1] += 1
+                if len(st[2]) < 5:
+                    st[2].add(r[XFF])
         return stats
 
     def records(self):
