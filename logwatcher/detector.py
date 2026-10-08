@@ -6,6 +6,7 @@ result()에서 IP별 판정(ip 모드) 또는 요청 단위 판정(request 모�
 
 위험도: 3=높음, 2=중간, 1=낮음
 """
+import heapq
 import ipaddress
 import re
 from array import array
@@ -214,6 +215,41 @@ def fmt_ts(ts):
     return "" if ts is None else time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts))
 
 
+class _Rows:
+    """근거 로그 보관: 시각이 가장 이른 n건과 가장 늦은 n건만 둔다(파일·줄이 어떤 순서로 들어와도 같은 결과)."""
+    __slots__ = ("n", "early", "late", "seq", "total")
+
+    def __init__(self, n):
+        self.n = n
+        self.early = []      # 최대 힙(-시각): 가장 이른 n건
+        self.late = []       # 최소 힙(시각): 가장 늦은 n건
+        self.seq = 0
+        self.total = 0
+
+    def add(self, row):
+        self.total += 1
+        self.seq += 1
+        ts, n = row[0], self.n
+        if len(self.early) < n:
+            heapq.heappush(self.early, (-ts, self.seq, row))
+        elif ts < -self.early[0][0]:
+            heapq.heapreplace(self.early, (-ts, self.seq, row))
+        if len(self.late) < n:
+            heapq.heappush(self.late, (ts, self.seq, row))
+        elif ts > self.late[0][0]:
+            heapq.heapreplace(self.late, (ts, self.seq, row))
+
+    def items(self):
+        """시각 오름차순 목록(중복 제거)."""
+        seen, out = set(), []
+        for _k, sq, r in self.early + self.late:
+            if sq not in seen:
+                seen.add(sq)
+                out.append((r[0], sq, r))
+        out.sort()
+        return [r for _t, _s, r in out]
+
+
 class _Hit:
     """규칙 하나의 누적 결과(건수, 2xx 응답 수, 상태코드 분포, 근거 로그)."""
     __slots__ = ("count", "success", "status", "rows", "ips", "level", "extra")
@@ -222,40 +258,69 @@ class _Hit:
         self.count = 0
         self.success = 0
         self.status = Counter()
-        self.rows = []
+        self.rows = _Rows(EVIDENCE_MAX)
         self.ips = set()
         self.level = 0       # 0이면 규칙 기본 등급 사용
         self.extra = {}      # 세부 분류(예: 프로토콜 이름) -> 건수
 
 
-class _IpAcc:
-    """IP별 누적. 대부분의 IP는 요청이 적으므로 컨테이너는 필요할 때만 만든다(메모리 절약)."""
-    __slots__ = ("n", "first", "last", "status", "ua", "ua_n", "ua_more", "dyn", "hits", "err", "err_rows",
-                 "nf", "login_fail", "login_rows", "login_post", "script_n", "script_rows")
+class _IpX:
+    """드물게만 필요한 IP별 상세. 해당 요청이 나올 때만 만든다."""
+    __slots__ = ("err_rows", "nf", "login_fail", "login_rows", "login_post", "script_n", "script_rows")
 
     def __init__(self):
-        self.n = 0
-        self.first = self.last = None
-        self.status = {}
-        self.ua = None
-        self.ua_n = 0
-        self.ua_more = None
-        self.dyn = None               # 정적 파일 제외 요청 시각(array)
-        self.hits = None              # 규칙 key -> _Hit
-        self.err = 0
         self.err_rows = None
         self.nf = None                # 404 경로 -> 근거 행
         self.login_fail = 0
         self.login_rows = None
-        self.login_post = None
+        self.login_post = None        # 로그인 POST 시각(array)
         self.script_n = 0
         self.script_rows = None
+
+
+_NO_X = _IpX()                        # 읽기 전용 빈 값(결과 계산 때 None 검사를 줄이기 위함)
+
+
+class _IpAcc:
+    """IP별 누적. 접속자는 많고 대부분 요청이 적으므로 필드를 최소로 두고 나머지는 필요할 때만 만든다."""
+    __slots__ = ("n", "first", "last", "ok", "status", "ua", "ua_n", "ua_more", "dyn", "hits", "err", "x")
+
+    def __init__(self):
+        self.n = 0
+        self.first = self.last = None
+        self.ok = 0                   # 응답코드 200 건수 (가장 흔해서 dict를 만들지 않는다)
+        self.status = None            # 200 이외 응답코드 -> 건수
+        self.ua = None
+        self.ua_n = 0
+        self.ua_more = None
+        self.dyn = None               # 정적 파일 제외 요청 시각: None / int(1건) / array
+        self.hits = None              # 규칙 key -> _Hit
+        self.err = 0
+        self.x = None                 # _IpX
+
+    def extra(self):
+        x = self.x
+        if x is None:
+            x = self.x = _IpX()
+        return x
 
     def user_agents(self):
         c = Counter(self.ua_more or {})
         if self.ua is not None:
             c[self.ua] += self.ua_n
         return c
+
+    def statuses(self):
+        c = Counter(self.status or {})
+        if self.ok:
+            c[200] += self.ok
+        return c
+
+    def dyn_times(self):
+        d = self.dyn
+        if d is None:
+            return ()
+        return (d,) if d.__class__ is int else d
 
 
 class Analyzer:
@@ -347,7 +412,7 @@ class Analyzer:
                 if any(h in low for h in hints) and rx.search(s):
                     k = key
                     break
-            if len(_url_cache) > 300000:
+            if len(_url_cache) > 100000:
                 _url_cache.clear()
             _url_cache[raw] = k
         return k
@@ -365,8 +430,7 @@ class Analyzer:
         if 200 <= status < 300:
             h.success += 1
         h.status[status] += 1
-        if len(h.rows) < EVIDENCE_MAX:
-            h.rows.append(row)
+        h.rows.add(row)
         if ip is not None and len(h.ips) < 2000:
             h.ips.add(ip)
         return h
@@ -390,7 +454,13 @@ class Analyzer:
             a.first = ts
         if a.last is None or ts > a.last:
             a.last = ts
-        a.status[status] = a.status.get(status, 0) + 1
+        if status == 200:
+            a.ok += 1
+        else:
+            d = a.status
+            if d is None:
+                d = a.status = {}
+            d[status] = d.get(status, 0) + 1
         if a.ua is None:
             a.ua, a.ua_n = ua, 1
         elif ua == a.ua:
@@ -408,7 +478,8 @@ class Analyzer:
         bad_method = proto_probe or (method != "-" and method not in self.allowed_methods)
         # 프로토콜 스캔의 400 응답은 '깨진/바이너리 요청'으로 이미 집계하므로 에러 다수 규칙에서는 뺀다
         is_err = status >= 400 and status != 499 and not proto_probe
-        is_404 = status == 404 and (a.nf is None or (path not in a.nf and len(a.nf) < 1000))
+        nf = a.x.nf if a.x is not None else None
+        is_404 = status == 404 and (nf is None or (path not in nf and len(nf) < 1000))
         dynamic = not _is_static(path, self.static_ext)
         login = dynamic and self.login_re is not None and self.login_re.search(path) is not None
 
@@ -424,11 +495,11 @@ class Analyzer:
             self._hit(a, "scanner", row, status)
             self._hit(self.glob, "scanner", row, status, ip)
         elif uk == "script":
-            a.script_n += 1
-            if a.script_rows is None:
-                a.script_rows = []
-            if len(a.script_rows) < SOFT_MAX:
-                a.script_rows.append(row)
+            x = a.extra()
+            x.script_n += 1
+            if x.script_rows is None:
+                x.script_rows = _Rows(SOFT_MAX)
+            x.script_rows.add(row)
         if bad_method:
             if proto_probe:
                 key = "malformed"
@@ -445,30 +516,36 @@ class Analyzer:
 
         # 이하는 IP별 집계가 있어야 의미 있는 규칙
         if dynamic:
-            if a.dyn is None:
-                a.dyn = array("q")
-            a.dyn.append(ts)
+            d = a.dyn
+            if d is None:
+                a.dyn = ts
+            elif d.__class__ is int:
+                a.dyn = array("q", (d, ts))
+            else:
+                d.append(ts)
         if is_err:
             a.err += 1
-            if a.err_rows is None:
-                a.err_rows = []
-            if len(a.err_rows) < SOFT_MAX:
-                a.err_rows.append(row)
+            x = a.extra()
+            if x.err_rows is None:
+                x.err_rows = _Rows(SOFT_MAX)
+            x.err_rows.add(row)
         if is_404:
-            if a.nf is None:
-                a.nf = {}
-            a.nf[path] = row
+            x = a.extra()
+            if x.nf is None:
+                x.nf = {}
+            x.nf[path] = row
         if login:
             if status in _AUTH_FAIL:      # 5xx는 서버 장애일 가능성이 커서 인증 실패로 세지 않는다
-                a.login_fail += 1
-                if a.login_rows is None:
-                    a.login_rows = []
-                if len(a.login_rows) < SOFT_MAX:
-                    a.login_rows.append(row)
+                x = a.extra()
+                x.login_fail += 1
+                if x.login_rows is None:
+                    x.login_rows = _Rows(SOFT_MAX)
+                x.login_rows.add(row)
             if method == "POST":
-                if a.login_post is None:
-                    a.login_post = array("q")
-                a.login_post.append(ts)
+                x = a.extra()
+                if x.login_post is None:
+                    x.login_post = array("q")
+                x.login_post.append(ts)
 
     # ------------------------------------------------------------ 에러로그
     def feed_error(self, rec):
@@ -569,7 +646,8 @@ class Analyzer:
     def _finding(key, level, desc, count, success, status, rows):
         return {"key": key, "label": guide.RULES[key]["label"], "level": level, "desc": desc,
                 "count": count, "success": success, "status": dict(status.most_common(6)),
-                "evidence": [_row_dict(r) for r in rows]}
+                "evidence": [_row_dict(r) for r in (rows.items() if isinstance(rows, _Rows) else rows)],
+                "evidence_total": rows.total if isinstance(rows, _Rows) else len(rows)}
 
     def _hit_finding(self, key, h, desc):
         return self._finding(key, h.level or guide.RULES[key]["level"], desc, h.count, h.success, h.status, h.rows)
@@ -582,34 +660,36 @@ class Analyzer:
             h = hits.get(key)
             if h:
                 fs.append(self._hit_finding(key, h, "%s %d건%s" % (guide.RULES[key]["label"], h.count, _extra_text(h))))
-        if "scanner" not in hits and a.script_n >= max(5, a.n // 2):
-            rows = a.script_rows or []
+        x = a.x or _NO_X
+        if "scanner" not in hits and x.script_n >= max(5, a.n // 2):
+            rows = x.script_rows.items() if x.script_rows else []
             fs.append(self._finding("script", LOW, "브라우저가 아닌 프로그램 접근 %d건 (%s)" % (
-                a.script_n, rows[0][5][:60] if rows else ""), a.script_n, 0, Counter(r[4] for r in rows), rows))
+                x.script_n, rows[0][5][:60] if rows else ""), x.script_n, 0, Counter(r[4] for r in rows), rows))
         # 건수 조건을 못 채우는 IP는 시각 정렬 계산을 건너뛴다(대량 로그에서 속도 확보)
-        if a.dyn is not None and len(a.dyn) >= min(cfg["rate_max_requests"], cfg["burst_max"]):
-            cnt, t0 = _max_window(a.dyn, cfg["rate_window_sec"])
+        dyn = a.dyn_times()
+        if len(dyn) >= min(cfg["rate_max_requests"], cfg["burst_max"]):
+            cnt, t0 = _max_window(dyn, cfg["rate_window_sec"])
             if cnt >= cfg["rate_max_requests"]:
                 fs.append(self._finding("rate", MEDIUM, "%d초 동안 %d건 요청 (%s부터, 정적 파일 제외)" % (
                     cfg["rate_window_sec"], cnt, fmt_ts(t0)), cnt, 0, Counter(), []))
             else:
-                bcnt, bt = _max_window(a.dyn, 1)
+                bcnt, bt = _max_window(dyn, 1)
                 if bcnt >= cfg["burst_max"]:
                     fs.append(self._finding("burst", LOW, "1초에 %d건 요청 (%s)" % (bcnt, fmt_ts(bt)),
                                             bcnt, 0, Counter(), []))
         if a.err >= cfg["error_min"] and a.err / a.n >= cfg["error_ratio"]:
             fs.append(self._finding("errors", MEDIUM, "전체 %d건 중 %d건(%.0f%%)이 에러 응답" % (
                 a.n, a.err, 100.0 * a.err / a.n), a.err, 0,
-                Counter({k: v for k, v in a.status.items() if k >= 400 and k != 499}), a.err_rows or []))
-        if a.nf is not None and len(a.nf) >= cfg["notfound_distinct"]:
-            fs.append(self._finding("notfound", MEDIUM, "존재하지 않는 경로 %d종 요청 (디렉터리 스캐닝 의심)" % len(a.nf),
-                                    len(a.nf), 0, Counter({404: len(a.nf)}), list(a.nf.values())[:EVIDENCE_MAX]))
-        if a.login_fail >= cfg["login_fail_min"]:
-            rows = a.login_rows or []
-            fs.append(self._finding("login_fail", MEDIUM, "로그인 관련 요청 실패 %d건" % a.login_fail,
-                                    a.login_fail, 0, Counter(r[4] for r in rows), rows))
-        if a.login_post is not None and len(a.login_post) >= cfg["login_post_max"]:
-            pc, _pt = _max_window(a.login_post, cfg["login_window_sec"])
+                Counter({k: v for k, v in (a.status or {}).items() if k >= 400 and k != 499}), x.err_rows.items() if x.err_rows else []))
+        if x.nf is not None and len(x.nf) >= cfg["notfound_distinct"]:
+            fs.append(self._finding("notfound", MEDIUM, "존재하지 않는 경로 %d종 요청 (디렉터리 스캐닝 의심)" % len(x.nf),
+                                    len(x.nf), 0, Counter({404: len(x.nf)}), _spread(x.nf.values(), EVIDENCE_MAX)))
+        if x.login_fail >= cfg["login_fail_min"]:
+            rows = x.login_rows.items() if x.login_rows else []
+            fs.append(self._finding("login_fail", MEDIUM, "로그인 관련 요청 실패 %d건" % x.login_fail,
+                                    x.login_fail, 0, Counter(r[4] for r in rows), rows))
+        if x.login_post is not None and len(x.login_post) >= cfg["login_post_max"]:
+            pc, _pt = _max_window(x.login_post, cfg["login_window_sec"])
             if pc >= cfg["login_post_max"]:
                 fs.append(self._finding("login_burst", MEDIUM, "%d분 안에 로그인 POST %d건 (무차별 대입 의심)" % (
                     cfg["login_window_sec"] // 60, pc), pc, 0, Counter(), []))
@@ -627,7 +707,7 @@ class Analyzer:
             "is_proxy": ip in self.auto_proxies or ip in self.trusted,
             "user_agent": uas.most_common(1)[0][0] if uas else "",
             "user_agents": uas.most_common(5),
-            "statuses": Counter(a.status).most_common(8),
+            "statuses": a.statuses().most_common(8),
         }
 
     def result(self, setting=None):
@@ -670,5 +750,11 @@ class Analyzer:
         return res
 
 
+def _spread(rows, n):
+    """시각순으로 정렬해 가장 이른 n/2건과 가장 늦은 n/2건을 고른다."""
+    rows = sorted(rows, key=lambda r: r[0])
+    return rows if len(rows) <= n else rows[:n // 2] + rows[-(n // 2):]
+
+
 def _row_dict(r):
-    return {"time": fmt_ts(r[0]), "ip": r[1], "method": r[2], "url": r[3], "status": r[4], "ua": r[5]}
+    return {"ts": r[0], "time": fmt_ts(r[0]), "ip": r[1], "method": r[2], "url": r[3], "status": r[4], "ua": r[5]}

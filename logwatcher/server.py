@@ -3,6 +3,7 @@ import atexit
 import csv
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import shutil
@@ -20,7 +21,18 @@ from .parser import LogReader
 from .resources import resource_path
 
 MODES = ("auto", "ip", "none")
+SORT_KEYS = ("level", "last", "first", "requests", "ip")
+# 정렬 기준을 처음 고를 때의 기본 방향(날짜·건수·위험도는 큰 쪽부터, IP·첫 접근은 작은 쪽부터)
+DEFAULT_DIR = {"level": "desc", "last": "desc", "first": "asc", "requests": "desc", "ip": "asc"}
 _LOCAL_HOSTS = ("127.0.0.1", "localhost")
+
+
+def _ip_sort_key(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+        return (0, a.version, int(a), "")
+    except ValueError:
+        return (1, 0, 0, ip)
 
 
 def csv_safe(v):
@@ -43,6 +55,7 @@ class State:
         self.days = max(0, int(self.cfg["recent_days"]))
         self.anchor = self.cfg["recent_anchor"] if self.cfg["recent_anchor"] in ("latest", "now") else "latest"
         self.now_fn = now_fn
+        self.sort_key, self.sort_dir, self.ev_dir = "level", "desc", "asc"     # IP 목록 정렬 / 근거 로그 시각순
         self.dir = None
         self.reset()
 
@@ -109,6 +122,39 @@ class State:
             self.mode = mode
             self._result = None
 
+    def set_sort(self, key=None, direction=None, ev=None):
+        """IP 목록 정렬(key: level/last/first/requests/ip, direction: asc/desc)과 근거 로그 시각순(ev: asc/desc)."""
+        with self.lock:
+            if key is not None and key not in SORT_KEYS:
+                raise ValueError("bad sort key")
+            if direction not in (None, "asc", "desc") or ev not in (None, "asc", "desc"):
+                raise ValueError("bad sort direction")
+            if key is not None:
+                self.sort_key = key
+                self.sort_dir = direction or DEFAULT_DIR[key]
+            elif direction is not None:
+                self.sort_dir = direction
+            if ev is not None:
+                self.ev_dir = ev
+
+    def sorted_ips(self, ips):
+        """화면과 CSV가 같은 순서를 쓰도록 정렬 기준을 한 곳에서 적용한다."""
+        key, desc = self.sort_key, self.sort_dir == "desc"
+        if key == "level":
+            return sorted(ips, key=lambda x: (x["level"], x["success_warn"], x["score"], x["requests"]), reverse=desc)
+        if key == "requests":
+            return sorted(ips, key=lambda x: (x["requests"], x["level"], x["score"]), reverse=desc)
+        if key == "ip":
+            return sorted(ips, key=lambda x: _ip_sort_key(x["ip"]), reverse=desc)
+        present = [x for x in ips if x[key]]           # first/last: 접근 기록이 없는(에러로그에만 나온) IP는 항상 맨 뒤
+        present.sort(key=lambda x: (x[key], x["level"], x["score"]), reverse=desc)
+        return present + [x for x in ips if not x[key]]
+
+    def ordered_findings(self, findings):
+        """근거 로그를 시각순(오름/내림)으로 정렬한 복사본."""
+        desc = self.ev_dir == "desc"
+        return [dict(f, evidence=sorted(f["evidence"], key=lambda e: e["ts"], reverse=desc)) for f in findings]
+
     def set_days(self, days):
         with self.lock:
             if not 0 <= days <= 3650:
@@ -146,8 +192,9 @@ class State:
                 "mode": res["mode"], "mode_setting": self.mode, "unreliable": res["unreliable"],
                 "reason": res["reason"], "verdict": res["verdict"],
                 # 목록에는 근거 로그를 싣지 않는다(상세 조회 때만). 요청 단위 모드는 항목 수가 적어 포함.
-                "ips": [self._ip_row(x) for x in res["ips"]],
-                "findings": res["findings"],
+                "ips": [self._ip_row(x) for x in self.sorted_ips(res["ips"])],
+                "findings": self.ordered_findings(res["findings"]),
+                "sort": {"key": self.sort_key, "dir": self.sort_dir, "ev": self.ev_dir},
             }
 
     @staticmethod
@@ -163,7 +210,8 @@ class State:
             res = self.result()
             if res is None:
                 return None
-            return next((x for x in res["ips"] if x["ip"] == ip), None)
+            x = next((x for x in res["ips"] if x["ip"] == ip), None)
+            return dict(x, findings=self.ordered_findings(x["findings"])) if x else None
 
     def result_csv(self):
         with self.lock:
@@ -172,13 +220,13 @@ class State:
             w = csv.writer(buf)
             if res["mode"] == "ip":
                 w.writerow(["위험도", "IP", "요청수", "탐지 내용", "정상응답 경고", "첫 접근", "마지막 접근", "User-Agent"])
-                for x in res["ips"]:
+                for x in self.sorted_ips(res["ips"]):
                     w.writerow([x["level_label"], csv_safe(x["ip"]), x["requests"],
                                 csv_safe(" / ".join("%s(%s)" % (f["label"], f["desc"]) for f in x["findings"])),
                                 "Y" if x["success_warn"] else "", x["first"], x["last"], csv_safe(x["user_agent"])])
             else:
                 w.writerow(["위험도", "탐지 항목", "건수", "출처 IP 수", "2xx 응답", "시각", "IP", "Method", "URL", "응답코드"])
-                for f in res["findings"]:
+                for f in self.ordered_findings(res["findings"]):
                     for e in f["evidence"] or [None]:
                         w.writerow([LEVEL_LABEL[f["level"]], f["label"], f["count"], f.get("ips", ""), f["success"]] +
                                    ([e["time"], csv_safe(e["ip"]), e["method"], csv_safe(e["url"]), e["status"]]
@@ -266,6 +314,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True})
             if path == "/api/mode":
                 STATE.set_mode(q.get("mode", ""))
+                return self._send(200, {"ok": True})
+            if path == "/api/sort":
+                STATE.set_sort(q.get("key"), q.get("dir"), q.get("ev"))
                 return self._send(200, {"ok": True})
             if path == "/api/range":
                 try:

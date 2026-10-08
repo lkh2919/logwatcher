@@ -17,6 +17,7 @@
 import calendar
 import gzip
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -337,8 +338,63 @@ def detect_format(sample_lines):
                      "첫 줄: " + lines[0][:120])
 
 
+BLOCK_LINES = 2048            # 시각 색인 단위(줄 수): 분석 범위 밖 블록은 읽지도 파싱하지도 않는다
+SAMPLE_BYTES = 40_000_000     # 이 크기까지는 모든 줄을 파싱해 LB 통계를 구하고, 더 크면 일부 줄만 표본으로 쓴다
+
+_MON_B = {m.encode(): i for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
+_FAST_ACCESS_RE = re.compile(rb"\[(\d\d)/([A-Za-z]{3})/(\d{4}):(\d\d):(\d\d):(\d\d)(?: ([+-])(\d\d)(\d\d))?[\].]")
+_FAST_ERROR_RE = re.compile(rb"^(\d{4})/(\d\d)/(\d\d) (\d\d):(\d\d):(\d\d) \[")
+
+
+class _FastTS:
+    """줄에서 시각만 정규식으로 뽑는다(디코딩·전체 파싱 없이). LineParser와 같은 값을 돌려준다.
+
+    JSON처럼 시각 위치가 고정되지 않은 형식은 None을 돌려주고 호출자가 전체 파싱으로 처리한다.
+    """
+
+    def __init__(self, fmt, display_offset_h, error_offset_h, haproxy_offset_h):
+        self.fmt = fmt
+        self.off = int(display_offset_h * 3600)
+        self.hap = int((display_offset_h - haproxy_offset_h) * 3600)
+        self.err = int((display_offset_h - error_offset_h) * 3600)
+        self.days = {}
+        self.enabled = fmt != FMT_JSON
+
+    def _midnight(self, y, mo, d):
+        k = (y, mo, d)
+        v = self.days.get(k)
+        if v is None:
+            v = self.days[k] = calendar.timegm((y, mo, d, 0, 0, 0, 0, 0, 0))
+        return v
+
+    def ts(self, raw):
+        try:
+            if self.fmt == FMT_ERROR:
+                m = _FAST_ERROR_RE.match(raw)
+                if not m:
+                    return None
+                y, mo, d, hh, mm, ss = map(int, m.groups())
+                return self._midnight(y, mo, d) + hh * 3600 + mm * 60 + ss + self.err
+            m = _FAST_ACCESS_RE.search(raw)
+            if not m:
+                return None
+            d, mon, y, hh, mm, ss, sign, th, tm = m.groups()
+            tz = 0
+            if sign:
+                tz = (int(th) * 3600 + int(tm) * 60) * (-1 if sign == b"-" else 1)
+            t = self._midnight(int(y), _MON_B[mon], int(d)) + int(hh) * 3600 + int(mm) * 60 + int(ss) - tz
+            return t + (self.hap if self.fmt == FMT_HAPROXY else self.off)
+        except (KeyError, ValueError, OverflowError):
+            return None
+
+
 class LogReader:
-    """파일을 한 줄씩 읽어 레코드를 내보낸다. 읽는 동안 info가 채워진다."""
+    """로그 파일 하나를 읽는다.
+
+    scan()  : 업로드 때 한 번. 형식·줄 수·기간(info)과 시각 블록 색인, LB 판별용 통계를 만든다.
+    records(cutoff) : 분석 때. cutoff보다 오래된 블록은 건너뛰고(평문 파일은 seek) 레코드를 내보낸다.
+    """
 
     def __init__(self, path, display_offset_h=9, error_offset_h=9, haproxy_offset_h=9):
         self.path = path
@@ -347,6 +403,9 @@ class LogReader:
         self.haproxy_offset = haproxy_offset_h
         self.info = {"lines": 0, "parsed": 0, "skipped": 0, "skipped_samples": [],
                      "first": None, "last": None, "format": "", "format_label": ""}
+        self.blocks = []          # [(바이트 오프셋, 줄 수, 읽은 줄 수, 최소 시각, 최대 시각), ...]
+        with open(path, "rb") as f:
+            self.gz = f.read(2) == b"\x1f\x8b"
         with open_text(path) as f:
             head = []
             for raw in f:
@@ -358,45 +417,129 @@ class LogReader:
         self.info["format"] = self.fmt
         self.info["format_label"] = FORMAT_LABEL[self.fmt]
 
+    def _parser(self):
+        return LineParser(self.fmt, self.offset, self.error_offset, self.haproxy_offset)
+
     def scan(self):
-        """파일을 한 번 훑어 기간·줄 수(info)와 접속 IP별 (요청 수, XFF 포함 수, XFF 값 종류)를 구한다.
+        """파일을 한 번 훑는다. 반환: LB/프록시 판별용 {접속 IP: [요청 수, XFF 포함 수, XFF 값 종류]}.
 
-        뒤의 값은 LB/프록시 자동 판별에 쓴다(접근 로그만).
+        XFF가 붙은 IP만 기록하므로 메모리가 거의 들지 않는다. 큰 파일은 일부 줄만 표본으로 파싱해
+        (요청 수는 표본 비율만큼 환산) 시간을 줄인다.
         """
-        stats = {}
-        for r in self.records():
-            if self.kind != "access" or len(r) != 11:
-                continue
-            st = stats.get(r[IP])
-            if st is None:
-                st = stats[r[IP]] = [0, 0, set()]
-            st[0] += 1
-            if r[XFF]:
-                st[1] += 1
-                if len(st[2]) < 5:
-                    st[2].add(r[XFF])
-        return stats
-
-    def records(self):
-        lp = LineParser(self.fmt, self.offset, self.error_offset, self.haproxy_offset)
+        lp = self._parser()
+        fast = _FastTS(self.fmt, self.offset, self.error_offset, self.haproxy_offset)
         info = self.info
         info.update(lines=0, parsed=0, skipped=0, skipped_samples=[], first=None, last=None)
+        size = os.path.getsize(self.path) * (8 if self.gz else 1)
+        step = max(1, size // SAMPLE_BYTES) if self.kind == "access" else 0
+        stats, blocks, cur = {}, [], None
+        idx = offset = 0
         with open_text(self.path) as f:
             for raw in f:
-                line = raw.decode("utf-8", "replace").rstrip("\r\n")
-                if not line.strip():
+                if idx % BLOCK_LINES == 0:
+                    cur = [offset, 0, 0, None, None]
+                    blocks.append(cur)
+                idx += 1
+                cur[1] += 1
+                offset += len(raw)
+                if not raw.strip():
                     continue
                 info["lines"] += 1
-                r = lp.parse(line)
-                if r is None:
-                    info["skipped"] += 1
-                    if len(info["skipped_samples"]) < 5:
-                        info["skipped_samples"].append(line[:300])
-                    continue
+                ts = fast.ts(raw) if fast.enabled else None
+                rec = None
+                if ts is None or (step and info["lines"] % step == 0):
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    rec = lp.parse(line)
+                    if rec is None and ts is None:
+                        info["skipped"] += 1
+                        if len(info["skipped_samples"]) < 5:
+                            info["skipped_samples"].append(line[:300])
+                        continue
+                    if ts is None:
+                        ts = rec[TS]
                 info["parsed"] += 1
-                ts = r[TS]
-                if info["first"] is None or ts < info["first"]:
-                    info["first"] = ts
-                if info["last"] is None or ts > info["last"]:
-                    info["last"] = ts
-                yield r
+                cur[2] += 1
+                if cur[3] is None or ts < cur[3]:
+                    cur[3] = ts
+                if cur[4] is None or ts > cur[4]:
+                    cur[4] = ts
+                if rec is not None and len(rec) == 11 and step:
+                    st = stats.get(rec[IP])
+                    if st is None and rec[XFF]:
+                        st = stats[rec[IP]] = [0, 0, set()]
+                    if st is not None:
+                        st[0] += 1
+                        if rec[XFF]:
+                            st[1] += 1
+                            if len(st[2]) < 5:
+                                st[2].add(rec[XFF])
+        self.blocks = [tuple(b) for b in blocks]
+        mins = [b[3] for b in self.blocks if b[3] is not None]
+        maxs = [b[4] for b in self.blocks if b[4] is not None]
+        info["first"] = min(mins) if mins else None
+        info["last"] = max(maxs) if maxs else None
+        for st in stats.values():
+            st[0] *= step
+            st[1] *= step
+        return stats
+
+    @staticmethod
+    def _skippable(block, cutoff):
+        return block[4] is None or block[4] < cutoff
+
+    def _read(self, f, lp, n_lines):
+        """현재 위치에서 최대 n_lines줄(None이면 끝까지)을 읽어 레코드를 내보낸다."""
+        info = self.info
+        count = 0
+        while n_lines is None or count < n_lines:
+            raw = f.readline()
+            if not raw:
+                return
+            count += 1
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if not line.strip():
+                continue
+            info["lines"] += 1
+            r = lp.parse(line)
+            if r is None:
+                info["skipped"] += 1
+                if len(info["skipped_samples"]) < 5:
+                    info["skipped_samples"].append(line[:300])
+                continue
+            info["parsed"] += 1
+            ts = r[TS]
+            if info["first"] is None or ts < info["first"]:
+                info["first"] = ts
+            if info["last"] is None or ts > info["last"]:
+                info["last"] = ts
+            yield r
+
+    def records(self, cutoff=None):
+        """레코드를 내보낸다. cutoff(표시 시간대 기준 시각)가 주어지면 그보다 오래된 블록은 건너뛴다.
+
+        블록 안에는 cutoff보다 오래된 레코드가 섞여 있을 수 있으므로 호출자가 한 번 더 걸러야 한다.
+        """
+        lp = self._parser()
+        self.info.update(lines=0, parsed=0, skipped=0, skipped_samples=[], first=None, last=None)
+        blocks = self.blocks
+        with open_text(self.path) as f:
+            if cutoff is None or not blocks:
+                yield from self._read(f, lp, None)
+                return
+            i, nb = 0, len(blocks)
+            while i < nb:
+                if not self._skippable(blocks[i], cutoff):
+                    yield from self._read(f, lp, blocks[i][1])
+                    i += 1
+                    continue
+                j = i + 1                                   # 건너뛸 블록을 한꺼번에 묶는다
+                while j < nb and self._skippable(blocks[j], cutoff):
+                    j += 1
+                if j >= nb:
+                    return
+                if self.gz:                                 # 압축 파일은 seek가 느려 읽기만 하고 파싱은 하지 않는다
+                    for _ in range(sum(b[1] for b in blocks[i:j])):
+                        f.readline()
+                else:
+                    f.seek(blocks[j][0])
+                i = j

@@ -5,6 +5,7 @@
   (접속자 IP는 HAProxy 기준, User-Agent는 nginx 기준).
 - 분석 범위는 최근 N일: 기준 시각은 로그의 마지막 시각(latest) 또는 현재 시각(now).
 """
+import gc
 import time
 
 from .detector import Analyzer
@@ -41,67 +42,97 @@ def window_bounds(entries, cfg, days, anchor_mode="latest", now_ts=None):
     return anchor, cutoff
 
 
+def _hkey(rec):
+    """HAProxy·nginx의 같은 요청을 짝짓는 키: (Method, URL)의 해시를 시각과 하나의 정수로 합친 값."""
+    return (hash((rec[METHOD], rec[PATH], rec[QUERY])) & 0xFFFFFFFFFFFF) << 32
+
+
 def analyze(entries, cfg, days, anchor_mode="latest", now_ts=None):
-    """entries: [{name, reader, kind, fmt, proxies, info}] -> 분석 결과 dict."""
+    """entries: [{name, reader, kind, fmt, proxies, info}] -> 분석 결과 dict.
+
+    분석 범위 밖의 로그는 읽지도 파싱하지도 않고(블록 단위로 건너뜀), 범위 안의 요청만 메모리에 집계한다.
+    """
+    gc_was_enabled = gc.isenabled()
+    gc.disable()            # 집계 중에는 순환 참조가 생기지 않아 GC가 시간만 쓴다
+    try:
+        return _analyze(entries, cfg, days, anchor_mode, now_ts)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+def _analyze(entries, cfg, days, anchor_mode, now_ts):
     a = Analyzer(cfg)
     a.register_proxies(merge_proxy_stats(entries))
     anchor, cutoff = window_bounds(entries, cfg, days, anchor_mode, now_ts)
     per = [{"in_range": 0, "excluded": 0, "merged": 0} for _ in entries]
 
-    def inside(ts):
-        return cutoff is None or ts >= cutoff
-
     has_hap = any(e["fmt"] == FMT_HAPROXY for e in entries)
     has_nginx = any(e["kind"] == "access" and e["fmt"] != FMT_HAPROXY for e in entries)
     merge_mode = has_hap and has_nginx
-    hmap = {}                      # (요청 해시, 시각) -> [(HAProxy 레코드, 파일 번호)]
+    # 병합용 색인: 키 -> [(HAProxy IP, User-Agent), ...]. 전체 레코드는 보관하지 않는다(메모리 절약).
+    hmap = {}
+    consumed = {}                  # nginx 요청과 짝지어진 HAProxy 요청 수(키별) -> 나중에 HAProxy를 다시 읽을 때 건너뜀
     merged_total = 0
     # HAProxy를 먼저 읽어 nginx 요청과 짝을 지을 수 있게 한다
     order = sorted(range(len(entries)), key=lambda i: entries[i]["fmt"] != FMT_HAPROXY)
     for i in order:
         e, st = entries[i], per[i]
+        reader = e["reader"]
         if e["kind"] == "error":
-            for rec in e["reader"].records():
-                if inside(rec[0]):
+            for rec in reader.records(cutoff):
+                if cutoff is None or rec[0] >= cutoff:
                     st["in_range"] += 1
                     a.feed_error(rec)
-                else:
-                    st["excluded"] += 1
         elif e["fmt"] == FMT_HAPROXY:
-            for rec in e["reader"].records():
-                if not inside(rec[0]):
-                    st["excluded"] += 1
+            for rec in reader.records(cutoff):
+                ts = rec[0]
+                if cutoff is not None and ts < cutoff:
                     continue
                 st["in_range"] += 1
                 if len(rec) == 6:                     # 서버 다운/복구, TLS 실패 같은 상태 줄
                     a.feed_error(rec)
                 elif merge_mode:
-                    hmap.setdefault((hash((rec[METHOD], rec[PATH], rec[QUERY])), rec[TS]), []).append((rec, i))
+                    hmap.setdefault(_hkey(rec) | ts, []).append((rec[IP], rec[UA]))
                 else:
                     a.feed(rec)
         else:
-            for rec in e["reader"].records():
-                if not inside(rec[TS]):
-                    st["excluded"] += 1
+            for rec in reader.records(cutoff):
+                ts = rec[TS]
+                if cutoff is not None and ts < cutoff:
                     continue
                 st["in_range"] += 1
                 if hmap and a._is_proxy(rec[IP]):     # LB/HAProxy를 거쳐 온 요청만 짝 후보
-                    k = hash((rec[METHOD], rec[PATH], rec[QUERY]))
+                    k = _hkey(rec)
                     for dt in _DEDUPE_OFFSETS:
-                        lst = hmap.get((k, rec[TS] + dt))
+                        key = k | (ts + dt)
+                        lst = hmap.get(key)
                         if lst:
-                            hrec, hi = lst.pop()
+                            hip, hua = lst.pop(0)     # 파일 순서대로: 나중에 HAProxy를 다시 읽을 때 앞에서부터 건너뛰는 것과 같은 순서
                             if not lst:
-                                del hmap[(k, rec[TS] + dt)]
-                            per[hi]["merged"] += 1
+                                del hmap[key]
+                            consumed[key] = consumed.get(key, 0) + 1
                             st["merged"] += 1
                             merged_total += 1
-                            rec = (rec[0], hrec[IP]) + rec[2:UA] + (rec[UA] or hrec[UA],) + rec[UA + 1:XFF] + ("",)
+                            rec = (rec[0], hip) + rec[2:UA] + (rec[UA] or hua,) + rec[UA + 1:XFF] + ("",)
                             break
                 a.feed(rec)
-    for lst in hmap.values():                         # nginx와 짝이 없는 HAProxy 요청
-        for hrec, _hi in lst:
-            a.feed(hrec)
+    # nginx와 짝이 없는 HAProxy 요청: HAProxy 파일을 범위 안만 다시 읽어 집계한다
+    if merge_mode:
+        for i, e in enumerate(entries):
+            if e["fmt"] != FMT_HAPROXY:
+                continue
+            for rec in e["reader"].records(cutoff):
+                if len(rec) == 6 or (cutoff is not None and rec[0] < cutoff):
+                    continue
+                key = _hkey(rec) | rec[0]
+                if consumed.get(key):                 # 이미 nginx 요청과 합쳐진 요청
+                    consumed[key] -= 1
+                    per[i]["merged"] += 1
+                    continue
+                a.feed(rec)
+    for e, st in zip(entries, per):
+        st["excluded"] = e["info"]["parsed"] - st["in_range"]
 
     notes = []
     if merge_mode:

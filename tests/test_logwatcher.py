@@ -522,6 +522,17 @@ class CombinedAnalysisTest(unittest.TestCase):
         self.assertNotIn("scanner", keys(self.st([nocap], recent_days=0)))
         self.assertIn("scanner", keys(self.st([nocap, n], recent_days=0)))
 
+    def test_merge_same_second_same_url_keeps_each_ip_once(self):
+        # 같은 초에 같은 URL을 서로 다른 두 IP가 요청: 병합 후에도 IP마다 한 번씩만 집계되어야 한다
+        hl = ['Oct  6 08:43:09 localhost haproxy[1]: 7.7.7.%d:5000 [06/Oct/2026:08:43:09.100] main~ be/s 0/0/0/1/1 200 10 "GET /same HTTP/1.1"' % i
+              for i in (1, 2, 3)]
+        nl = [line(ip="10.0.0.5", req="GET /same HTTP/1.1", t="06/Oct/2026:08:43:09 +0900", xff="-") for _ in range(2)]
+        st = self.st([_write(self.tmp.name, "h.log", hl), _write(self.tmp.name, "n.log", nl)], recent_days=0)
+        a = st.analysis()["analyzer"]
+        self.assertEqual(a.total, 3)                                  # 3 + 2 - 합친 2
+        self.assertEqual(sorted((ip, x.n) for ip, x in a.ips.items()), [("7.7.7.1", 1), ("7.7.7.2", 1), ("7.7.7.3", 1)])
+        self.assertEqual(st.analysis()["merged"], 2)
+
     def test_haproxy_nginx_without_overlap_warns(self):
         h = _write(self.tmp.name, "h.log", _read("haproxy.log"))
         n = _write(self.tmp.name, "n.log", _read("nginx_clean.log"))
@@ -593,6 +604,249 @@ class CombinedAnalysisTest(unittest.TestCase):
         self.assertTrue(st.summary()["empty"])
 
 
+class ReaderOptimizationTest(unittest.TestCase):
+    """분석 범위 밖 로그를 읽지·파싱하지 않는 최적화가 결과를 바꾸지 않는지 확인한다."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        old = parser.BLOCK_LINES
+        parser.BLOCK_LINES = 50                   # 블록을 많이 만들어 건너뛰기 경로를 충분히 시험
+        self.addCleanup(lambda: setattr(parser, "BLOCK_LINES", old))
+
+    def lines(self, n=1000, shuffle=0):
+        rows = []
+        for i in range(n):
+            day = 1 + i * 20 // n                  # 20일에 걸친 로그
+            rows.append(line(ip="9.9.%d.%d" % (i % 200, i % 250), req="GET /p%d HTTP/1.1" % i,
+                             t="%02d/Oct/2026:%02d:%02d:%02d +0900" % (day, i % 24, i % 60, (i * 7) % 60)))
+        rng = __import__("random").Random(1)
+        for _ in range(shuffle):                   # 시각 순서가 조금 어긋난 로그
+            a, b = rng.randrange(n), rng.randrange(n)
+            rows[a], rows[b] = rows[b], rows[a]
+        return rows
+
+    def cutoff(self):
+        import calendar
+        return calendar.timegm((2026, 10, 14, 0, 0, 0, 0, 0, 0))
+
+    def same(self, name, rows, gz=False):
+        p = _write(self.tmp.name, name, rows, gz=gz)
+        rd = parser.LogReader(p)
+        rd.scan()
+        cut = self.cutoff()
+        full = [r for r in rd.records() if r[0] >= cut]
+        fast = [r for r in rd.records(cut) if r[0] >= cut]
+        self.assertEqual(fast, full, name)
+        self.assertTrue(full)
+        return rd, p
+
+    def test_cutoff_results_are_identical(self):
+        self.same("sorted.log", self.lines())
+        self.same("shuffled.log", self.lines(shuffle=200))            # 정렬되지 않은 로그도 정확해야 함
+        self.same("crlf.log", [l + "\r" for l in self.lines()])
+        self.same("sorted.gz", self.lines(), gz=True)
+        garbage = []
+        for i, l in enumerate(self.lines()):
+            garbage.append(l)
+            if i % 17 == 0:
+                garbage += ["garbage line", ""]
+        self.same("garbage.log", garbage)
+
+    def test_old_blocks_are_not_read(self):
+        rd, p = self.same("sorted.log", self.lines())
+        n_old = sum(1 for _ in rd.records())
+        list(rd.records(self.cutoff()))
+        # 범위 밖 블록을 건너뛰었으므로 읽은 줄 수가 전체보다 적다
+        self.assertLess(rd.info["lines"], n_old * 0.6)
+        self.assertGreater(len(rd.blocks), 10)
+
+    def test_everything_old_yields_nothing(self):
+        p = _write(self.tmp.name, "old.log", self.lines())
+        rd = parser.LogReader(p)
+        rd.scan()
+        import calendar
+        self.assertEqual(list(rd.records(calendar.timegm((2027, 1, 1, 0, 0, 0, 0, 0, 0)))), [])
+        self.assertEqual(len(list(rd.records(0))), 1000)
+
+    def test_fast_timestamp_equals_full_parser(self):
+        for name in ("nginx_access.log", "nginx_bracket_lb.log", "haproxy.log", "nginx_error.log"):
+            p = os.path.join(SAMPLES, name)
+            rd = parser.LogReader(p, 9, 7, 8)             # 시간대 변환 경로도 함께 확인
+            lp = rd._parser()
+            fast = parser._FastTS(rd.fmt, 9, 7, 8)
+            checked = 0
+            with open(p, "rb") as f:
+                for raw in f:
+                    rec = lp.parse(raw.decode("utf-8").rstrip("\n"))
+                    if rec is None or len(rec) not in (6, 11):
+                        continue
+                    ts = fast.ts(raw)
+                    if ts is not None:
+                        self.assertEqual(ts, rec[0], (name, raw[:80]))
+                        checked += 1
+            self.assertGreater(checked, 50, name)
+        self.assertFalse(parser._FastTS(parser.FMT_JSON, 9, 9, 9).enabled)             # JSON은 전체 파싱 경로
+
+    def test_scan_info_matches_full_read(self):
+        for name in ("nginx_access.log", "haproxy.log", "nginx_error.log", "nginx_json.log"):
+            rd = parser.LogReader(os.path.join(SAMPLES, name))
+            rd.scan()
+            scan_info = {k: rd.info[k] for k in ("lines", "parsed", "skipped", "first", "last")}
+            list(rd.records())
+            self.assertEqual({k: rd.info[k] for k in scan_info}, scan_info, name)
+
+    def test_large_file_sampling_still_detects_lb(self):
+        old = parser.SAMPLE_BYTES
+        parser.SAMPLE_BYTES = 5000                 # 작은 파일도 표본 추출 경로로 처리
+        self.addCleanup(lambda: setattr(parser, "SAMPLE_BYTES", old))
+        lb = "203.0.113.250"
+        rows = [line(ip=lb, req="GET /p%d HTTP/1.1" % i, xff="175.1.1.%d" % (i % 40)) for i in range(2000)]
+        rows += [line(ip="198.51.100.%d" % (i % 90), req="GET /d%d HTTP/1.1" % i, xff="-") for i in range(2000)]
+        p = _write(self.tmp.name, "lb.log", rows)
+        rd = parser.LogReader(p)
+        stats = rd.scan()
+        self.assertEqual(list(stats), [lb])                         # XFF가 붙은 IP만 기록(메모리 절약)
+        n, nx, xs = stats[lb]
+        self.assertGreater(n, 1000)                                 # 표본 비율만큼 환산
+        self.assertEqual(rd.info["parsed"], 4000)                   # 줄 수·기간은 표본과 무관하게 정확
+        a = Analyzer(cfg())
+        a.register_proxies({lb: stats[lb]})
+        self.assertEqual(list(a.auto_proxies), [lb])
+
+    def test_only_in_range_ips_are_kept_in_memory(self):
+        old = [line(ip="1.1.%d.%d" % (i // 250, i % 250), t="01/Sep/2026:10:00:00 +0900") for i in range(3000)]
+        new = [line(ip="2.2.2.%d" % i, t="10/Oct/2026:10:00:00 +0900") for i in range(20)]
+        st = server.State(cfg())
+        self.addCleanup(st.cleanup)
+        st.add_file("a.log", _write(self.tmp.name, "a.log", old + new), "a")
+        a = st.analysis()["analyzer"]
+        self.assertEqual(len(a.ips), 20)                            # 7일 밖의 3000개 IP는 집계 대상이 아님
+        self.assertEqual(a.total, 20)
+        self.assertEqual(st.analysis()["excluded"], 3000)
+
+
+class SortTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def state(self, *names, **kw):
+        st = server.State(cfg(recent_days=0, **kw))
+        self.addCleanup(st.cleanup)
+        for n in names:
+            r = st.add_file(n, os.path.join(SAMPLES, n), n)
+            self.assertNotIn("error", r, r)
+        return st
+
+    def ips(self, st):
+        return [x["ip"] for x in st.summary()["ips"]]
+
+    def test_default_order_is_unchanged(self):
+        st = self.state("nginx_access.log")
+        sm = st.summary()
+        self.assertEqual(sm["sort"], {"key": "level", "dir": "desc", "ev": "asc"})
+        levels = [x["level"] for x in sm["ips"]]
+        self.assertEqual(levels, sorted(levels, reverse=True))
+        self.assertEqual(self.ips(st), [x["ip"] for x in st.result()["ips"]])     # 분석기가 정한 기존 순서와 같다
+
+    def test_sort_by_date_both_directions(self):
+        st = self.state("nginx_access.log")
+        for key in ("last", "first"):
+            st.set_sort(key, "desc")
+            vals = [x[key] for x in st.summary()["ips"]]
+            self.assertEqual(vals, sorted(vals, reverse=True), key)
+            self.assertGreater(len(set(vals)), 3)                    # 날짜가 실제로 다양해야 의미 있는 검증
+            st.set_sort(key, "asc")
+            vals = [x[key] for x in st.summary()["ips"]]
+            self.assertEqual(vals, sorted(vals), key)
+        # 키만 바꾸면 그 키의 기본 방향: 마지막 접근은 최신순, 첫 접근은 오래된 순
+        st.set_sort("last")
+        self.assertEqual(st.summary()["sort"], {"key": "last", "dir": "desc", "ev": "asc"})
+        st.set_sort("first")
+        self.assertEqual(st.summary()["sort"]["dir"], "asc")
+        st.set_sort(direction="desc")                                 # 방향만 바꾸기
+        self.assertEqual(st.summary()["sort"], {"key": "first", "dir": "desc", "ev": "asc"})
+
+    def test_sort_by_requests_level_and_ip(self):
+        st = self.state("nginx_access.log")
+        st.set_sort("requests", "desc")
+        r = [x["requests"] for x in st.summary()["ips"]]
+        self.assertEqual(r, sorted(r, reverse=True))
+        st.set_sort("requests", "asc")
+        self.assertEqual([x["requests"] for x in st.summary()["ips"]], sorted(r))
+        st.set_sort("level", "asc")
+        lv = [x["level"] for x in st.summary()["ips"]]
+        self.assertEqual(lv, sorted(lv))
+        st.set_sort("ip", "asc")                                       # 문자열이 아니라 숫자 순서(192 < 198 < 203)
+        self.assertEqual(self.ips(st), ["192.0.2.77", "192.0.2.88", "198.51.100.20", "198.51.100.50", "198.51.100.60", "203.0.113.9"])
+        st.set_sort("ip", "desc")
+        self.assertEqual(self.ips(st)[0], "203.0.113.9")
+
+    def test_ips_without_access_time_stay_last(self):
+        st = self.state("nginx_error.log")                           # 에러로그에만 나온 IP: 요청 0건
+        st.set_sort("requests", "desc")
+        self.assertEqual(len(self.ips(st)), 3)
+        st.set_sort("last", "asc")
+        lasts = [x["last"] for x in st.summary()["ips"]]
+        self.assertEqual(lasts, sorted(lasts))
+
+    def test_evidence_keeps_earliest_and_latest_and_sorts(self):
+        rows = [line(ip="9.9.9.9", req="GET /a?id=1%27%20UNION%20SELECT%201-- HTTP/1.1",
+                     t="08/Oct/2026:%02d:%02d:00 +0900" % (i // 60, i % 60)) for i in range(200)]    # 200건: 00:00 ~ 03:19
+        st = server.State(cfg(recent_days=0, ip_mode="ip"))     # 한 IP가 전부라 자동 판별이면 요청 단위 모드가 된다
+        self.addCleanup(st.cleanup)
+        st.add_file("e.log", _write(self.tmp.name, "e.log", rows), "e")
+        ev = st.ip_detail("9.9.9.9")["findings"][0]
+        self.assertEqual((ev["count"], ev["evidence_total"], len(ev["evidence"])), (200, 200, 60))
+        times = [e["time"][11:16] for e in ev["evidence"]]
+        self.assertEqual(times, sorted(times))                                   # 기본: 오래된 순
+        self.assertEqual((times[0], times[-1]), ("00:00", "03:19"))              # 가장 이른 것과 가장 최근 것이 모두 보관됨
+        self.assertIn("00:29", times)                                            # 처음 30건
+        self.assertIn("03:19", times)
+        self.assertNotIn("01:40", times)                                         # 중간 구간은 보관하지 않음
+        st.set_sort(ev="desc")
+        times = [e["time"][11:16] for e in st.ip_detail("9.9.9.9")["findings"][0]["evidence"]]
+        self.assertEqual(times, sorted(times, reverse=True))
+        self.assertEqual(times[0], "03:19")                                      # 최신순에서는 가장 최근 요청이 맨 위
+
+    def test_evidence_is_independent_of_input_order(self):
+        import random
+        rows = [line(ip="9.9.9.9", req="GET /a?id=1%27%20UNION%20SELECT%201-- HTTP/1.1",
+                     t="08/Oct/2026:%02d:%02d:00 +0900" % (i // 60, i % 60)) for i in range(200)]
+        shuffled = rows[:]
+        random.Random(4).shuffle(shuffled)
+        a, b = server.State(cfg(recent_days=0, ip_mode="ip")), server.State(cfg(recent_days=0, ip_mode="ip"))
+        self.addCleanup(a.cleanup)
+        self.addCleanup(b.cleanup)
+        a.add_file("a.log", _write(self.tmp.name, "a.log", rows), "a")
+        b.add_file("b.log", _write(self.tmp.name, "b.log", shuffled), "b")
+        ev = lambda st: [e["time"] for e in st.ip_detail("9.9.9.9")["findings"][0]["evidence"]]
+        self.assertEqual(ev(a), ev(b))
+
+    def test_request_mode_evidence_order_and_csv_follow_sort(self):
+        st = self.state("nginx_behind_lb.log")
+        self.assertEqual(st.summary()["mode"], "request")
+        times = lambda: [e["time"] for f in st.summary()["findings"] for e in f["evidence"] if f["key"] == "probe"]
+        asc = times()
+        self.assertEqual(asc, sorted(asc))
+        st.set_sort(ev="desc")
+        self.assertEqual(times(), sorted(asc, reverse=True))
+        st2 = self.state("nginx_access.log")
+        st2.set_sort("ip", "desc")
+        rows = [r for r in __import__("csv").reader(st2.result_csv().splitlines())][1:]
+        self.assertEqual([r[1] for r in rows][0], "203.0.113.9")                  # CSV도 화면과 같은 순서
+        st2.set_sort("ip", "asc")
+        self.assertEqual([r[1] for r in __import__("csv").reader(st2.result_csv().splitlines())][1], "192.0.2.77")
+
+    def test_invalid_sort_values(self):
+        st = self.state("nginx_access.log")
+        for bad in ({"key": "nope"}, {"direction": "up"}, {"ev": "sideways"}):
+            with self.assertRaises(ValueError):
+                st.set_sort(**bad)
+        self.assertEqual(st.summary()["sort"], {"key": "level", "dir": "desc", "ev": "asc"})
+
+
 class ServerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -647,6 +901,20 @@ class ServerTest(unittest.TestCase):
         for bad in ("abc", "-1", "99999", ""):
             self.assertEqual(self.req("POST", "/api/range?days=" + bad)[0], 400, bad)
         self.req("POST", "/api/range?days=0")
+        self.req("POST", "/api/reset")
+
+    def test_sort_api(self):
+        self.req("POST", "/api/reset")
+        with open(os.path.join(SAMPLES, "nginx_access.log"), "rb") as f:
+            self.assertEqual(self.req("POST", "/api/upload?name=a.log", f.read())[0], 200)
+        self.assertEqual(self.req("POST", "/api/sort?key=last&dir=asc&ev=desc")[0], 200)
+        s = json.loads(self.req("GET", "/api/summary")[1])
+        self.assertEqual(s["sort"], {"key": "last", "dir": "asc", "ev": "desc"})
+        lasts = [x["last"] for x in s["ips"]]
+        self.assertEqual(lasts, sorted(lasts))
+        for bad in ("key=zzz", "dir=left", "ev=x"):
+            self.assertEqual(self.req("POST", "/api/sort?" + bad)[0], 400, bad)
+        self.req("POST", "/api/sort?key=level&dir=desc&ev=asc")
         self.req("POST", "/api/reset")
 
     def test_bad_file(self):
