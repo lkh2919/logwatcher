@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LogWatcher - nginx·HAProxy 위협 로그 점검</title>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--ink:#1d2330;--sub:#667085;--line:#e3e6ec;--hi:#d92d20;--hib:#fef3f2;--mid:#dc6803;--midb:#fffaeb;--lo:#5b5fc7;--lob:#f1f1fd;--ok:#067647;--okb:#ecfdf3;--acc:#2563eb}
+@media (prefers-color-scheme:dark){:root{--bg:#12151c;--card:#1a1e28;--ink:#e6e9f0;--sub:#9aa3b5;--line:#2b3140;--hi:#f97066;--hib:#3b1a18;--mid:#fdb022;--midb:#3a2a0c;--lo:#a4a8f0;--lob:#23244a;--ok:#47cd89;--okb:#10301f;--acc:#6ea0ff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 "Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif}
+header{padding:14px 20px;display:flex;align-items:baseline;gap:10px;border-bottom:1px solid var(--line);background:var(--card)}
+header b{font-size:18px}header span{color:var(--sub);font-size:12px}
+main{max-width:1100px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+h2{font-size:14px;margin:0 0 10px}
+#drop{border:2px dashed var(--line);border-radius:10px;padding:26px;text-align:center;color:var(--sub);cursor:pointer}
+#drop.on{border-color:var(--acc);color:var(--acc)}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12px;color:var(--sub);font-weight:600}
+.mono{font-family:Consolas,monospace;font-size:12px;word-break:break-all}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;font-weight:600;white-space:nowrap}
+.l3{background:var(--hib);color:var(--hi)}.l2{background:var(--midb);color:var(--mid)}.l1{background:var(--lob);color:var(--lo)}
+.chip{display:inline-block;margin:1px 3px 1px 0;padding:0 7px;border-radius:5px;font-size:12px;border:1px solid var(--line)}
+.chip.l3{border-color:var(--hi)}.chip.l2{border-color:var(--mid)}.chip.l1{border-color:var(--lo)}
+#verdict{border-radius:10px;padding:16px 18px;font-size:20px;font-weight:700;margin-bottom:14px}
+#verdict.ok{background:var(--okb);color:var(--ok)}#verdict.alert{background:var(--hib);color:var(--hi)}
+#verdict small{display:block;font-size:13px;font-weight:400;color:var(--sub);margin-top:2px}
+.warn{background:var(--midb);color:var(--mid);border-radius:8px;padding:8px 12px;margin-bottom:12px}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+button,select{font:inherit;padding:4px 10px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);cursor:pointer}
+button.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+tr.row{cursor:pointer}tr.row:hover{background:var(--bg)}
+.detail{background:var(--bg);padding:10px 14px}
+.f{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:8px 0}
+.f h3{font-size:13px;margin:0 0 4px}.f p{margin:4px 0}.f ul{margin:2px 0 6px 18px;padding:0}
+.k{color:var(--sub);font-size:12px;font-weight:600;margin-top:6px}
+.sw{color:var(--hi);font-weight:700}
+.muted{color:var(--sub)}
+details summary{cursor:pointer;color:var(--acc)}
+.err{color:var(--hi)}
+.ev td{font-size:12px}
+@media (max-width:700px){main{padding:8px}th:nth-child(n+5),td:nth-child(n+5){display:none}}
+</style>
+</head>
+<body>
+<header><b>LogWatcher</b><span>nginx·HAProxy 위협 로그 점검 · <span id="ver"></span></span></header>
+<main>
+  <div class="card">
+    <div class="bar"><h2 style="margin:0">1. 로그 파일 올리기</h2><span style="flex:1"></span><button id="reset">전체 초기화</button></div>
+    <div id="drop">nginx access.log 파일을 여기로 끌어다 놓거나 클릭해서 선택하세요<br>
+      <small>nginx access.log(combined·JSON·대괄호형) · nginx error.log · HAProxy 로그, .gz 지원 · 여러 파일 동시 선택 가능 · 파일은 이 PC 밖으로 전송되지 않습니다</small>
+      <input id="file" type="file" multiple hidden></div>
+    <div id="msg" style="margin-top:8px"></div>
+    <div id="files"></div>
+  </div>
+  <div id="out"></div>
+  <details class="card" id="lvguide"><summary>위험도 기준 안내</summary><div id="lvbody"></div></details>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let STATUS = null, SUM = null;
+const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const LV = {3:"높음",2:"중간",1:"낮음"};
+const badge = l => `<span class="badge l${l}">${LV[l]||"-"}</span>`;
+
+async function api(path, opt) {
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({error: "응답을 읽을 수 없습니다"}));
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+
+async function init() {
+  STATUS = await api("/api/status");
+  $("ver").textContent = "v" + STATUS.version;
+  $("lvbody").innerHTML = STATUS.level_guide.map(g =>
+    `<p>${badge(g.level)} <b>${esc(g.when)}</b> — ${esc(g.summary)}</p><ul>${g.detail.map(d => `<li>${esc(d)}</li>`).join("")}</ul>`).join("") +
+    `<ul>${STATUS.level_notes.map(n => `<li>${esc(n)}</li>`).join("")}</ul>`;
+  await refresh();
+}
+
+async function upload(files) {
+  const msg = $("msg"); msg.innerHTML = "";
+  for (const f of files) {
+    msg.innerHTML = `분석 중… ${esc(f.name)}`;
+    try {
+      const r = await fetch("/api/upload?name=" + encodeURIComponent(f.name), {method: "POST", body: f});
+      const j = await r.json();
+      if (!r.ok) msg.innerHTML += `<div class="err">${esc(j.name || f.name)}: ${esc(j.error)}</div>`;
+    } catch (e) { msg.innerHTML += `<div class="err">${esc(f.name)}: ${esc(e.message)}</div>`; }
+  }
+  if (!msg.querySelector(".err")) msg.textContent = "분석이 끝났습니다.";
+  await refresh();
+}
+
+async function refresh() {
+  SUM = await api("/api/summary");
+  renderFiles(); renderOut();
+}
+
+function renderFiles() {
+  const fs = SUM.files || [];
+  $("files").innerHTML = !fs.length ? "" : `<table><tr><th>파일</th><th>형식</th><th>줄 수</th><th>기간</th><th>읽기 실패</th></tr>` +
+    fs.map(f => `<tr><td>${esc(f.name)}</td><td>${esc(f.format_label)}</td><td>${f.parsed.toLocaleString()}</td><td class="mono">${esc(f.first)} ~ ${esc(f.last)}</td>
+    <td${f.skipped ? ` title="${esc((f.skipped_samples||[]).join("\n"))}"` : ""}>${f.skipped ? `<span class="err">${f.skipped}줄</span>` : "-"}</td></tr>`).join("") + `</table>`;
+}
+
+function renderOut() {
+  const o = $("out");
+  if (SUM.empty) { o.innerHTML = ""; return; }
+  const v = SUM.verdict, req = SUM.mode === "request";
+  const notes = [];
+  (SUM.warnings || []).forEach(w => notes.push(esc(w)));
+  if ((SUM.auto_proxies || []).length)
+    notes.push(`LB/프록시로 자동 판단된 IP: ${SUM.auto_proxies.map(p => `<b class="mono">${esc(p.ip)}</b>(${p.requests.toLocaleString()}건)`).join(", ")} — 이 IP가 보낸 요청은 <b>X-Forwarded-For의 실제 접속자 IP</b>로 판정했습니다. 맞지 않으면 config.json의 <span class="mono">auto_proxy</span>를 false로 바꾸세요.`);
+  let h = `<div id="verdict" class="${v.status}">${v.status === "ok" ? "✔ " : "⚠ "}${esc(v.text)}
+    <small>분석 기간 ${esc(SUM.period[0])} ~ ${esc(SUM.period[1])} · 전체 요청 ${SUM.total.toLocaleString()}건 · 접속 IP ${SUM.unique_ips.toLocaleString()}개${SUM.xff_used ? ` · X-Forwarded-For 사용 ${SUM.xff_used.toLocaleString()}건` : ""}</small></div>`;
+  notes.forEach(n => { h += `<div class="warn">${n}</div>`; });
+  if (SUM.unreliable && SUM.mode_setting === "auto")
+    h += `<div class="warn">IP를 구분할 수 없는 로그로 판단해 <b>요청 단위</b>로 판정했습니다. (${esc(SUM.reason)}) LB 뒤의 로그이고 X-Forwarded-For가 기록되지 않은 경우입니다. IP별 규칙(과다 접속·에러 다수·로그인 시도 등)은 적용되지 않습니다.</div>`;
+  h += `<div class="card"><div class="bar"><h2 style="margin:0">2. 탐지 결과</h2><span style="flex:1"></span>
+    <label class="muted">IP 구분 <select id="mode">
+      <option value="auto">자동 판별</option><option value="ip">IP별 판정</option><option value="none">IP 구분 안 함</option></select></label>
+    <button class="pri" id="csv">결과 CSV 저장</button></div>`;
+  h += req ? renderFindings() : renderIps();
+  h += `</div>`;
+  h += renderErrorLog();
+  o.innerHTML = h;
+  $("mode").value = SUM.mode_setting;
+  $("mode").onchange = async e => { await api("/api/mode?mode=" + e.target.value, {method: "POST"}); await refresh(); };
+  $("csv").onclick = () => { location.href = "/api/export/result.csv"; };
+  o.querySelectorAll("tr.row").forEach(tr => tr.onclick = () => toggleDetail(tr));
+  const lt = $("lowtoggle"); if (lt) lt.onclick = () => { SHOW_LOW = !SHOW_LOW; renderOut(); };
+}
+
+function renderErrorLog() {
+  const e = SUM.errorlog;
+  if (!e) return "";
+  const lv = Object.entries(e.levels).map(([k, v]) => `${esc(k)} ${v.toLocaleString()}건`).join(" · ");
+  let h = `<div class="card"><h2>3. 서버 상태 (nginx error.log)</h2>
+    <p class="muted">전체 ${e.total.toLocaleString()}줄 (${lv}) · 연결 종료 등 정상 범주 ${e.noise.toLocaleString()}줄 · 보안 신호 ${e.security.toLocaleString()}줄(위 탐지 결과에 반영됨)<br>
+    이 항목은 위협 IP 판정(이상 유무)에 포함되지 않는 <b>서버 운영 참고</b> 정보입니다.</p>`;
+  if (!e.ops.length) return h + `<p class="muted">운영상 확인이 필요한 오류(emerg·alert·crit·error)가 없습니다.</p></div>`;
+  h += e.ops.map(o => `<div class="f"><h3><span class="badge l${o.level === "emerg" || o.level === "alert" || o.level === "crit" ? 3 : 2}">${esc(o.level)}</span> ${esc(o.label)} <span class="muted">— ${o.count.toLocaleString()}건 (${esc(o.first)} ~ ${esc(o.last)})</span></h3>
+    <div class="mono muted">${esc(o.sample)}</div>${o.what ? `<div class="k">의미</div><p>${esc(o.what)}</p>` : ""}${o.actions ? `<div class="k">조치 가이드</div><p>${esc(o.actions)}</p>` : ""}</div>`).join("");
+  return h + `</div>`;
+}
+
+let SHOW_LOW = false;
+function renderIps() {
+  if (!SUM.ips.length) return `<p class="muted">탐지된 IP가 없습니다.</p>`;
+  const lowN = SUM.ips.filter(x => x.level === 1).length;
+  const rows = SUM.ips.filter(x => SHOW_LOW || x.level > 1);
+  let h = lowN ? `<div class="bar muted">${SHOW_LOW ? "낮음 포함 전체" : "높음·중간만 표시"} (${rows.length}개) · 낮음(참고) ${lowN}개 <button id="lowtoggle">${SHOW_LOW ? "낮음 숨기기" : "낮음도 보기"}</button></div>` : "";
+  if (!rows.length) return h + `<p class="muted">높음·중간으로 탐지된 IP가 없습니다.</p>`;
+  return h + `<table><tr><th>위험도</th><th>IP</th><th>요청 수</th><th>탐지 내용</th><th>접근 기간</th></tr>` +
+    rows.map(x => `<tr class="row" data-ip="${esc(x.ip)}"><td>${badge(x.level)}</td><td class="mono">${esc(x.ip)}</td><td>${x.requests ? x.requests.toLocaleString() : "-"}</td>
+      <td>${x.is_proxy ? `<span class="chip" title="LB/프록시 자체의 요청이라 실제 접속자 IP를 알 수 없습니다">LB/프록시</span>` : ""}${x.findings.map(f => `<span class="chip l${f.level}">${esc(f.label)}</span>`).join("")}${x.success_warn ? ` <span class="sw" title="공격 요청이 2xx 정상 응답을 받았습니다">⚠ 정상 응답</span>` : ""}</td>
+      <td class="mono">${esc(x.first)}<br>~ ${esc(x.last)}</td></tr>`).join("") + `</table>`;
+}
+
+function renderFindings() {
+  if (!SUM.findings.length) return `<p class="muted">탐지된 항목이 없습니다.</p>`;
+  return SUM.findings.map(f => findingHtml(f)).join("");
+}
+
+function findingHtml(f) {
+  const g = STATUS.rules[f.key] || {};
+  const warn = f.success && STATUS.success_warn.includes(f.key);
+  const st = Object.entries(f.status || {}).map(([k, v]) => `${k}:${v}건`).join(", ");
+  let h = `<div class="f"><h3>${badge(f.level)} ${esc(f.label)} <span class="muted">— ${esc(f.desc)}</span>${warn ? ` <span class="sw">⚠ 정상 응답(2xx) ${f.success}건</span>` : ""}</h3>`;
+  if (st) h += `<div class="muted">응답코드 ${esc(st)}</div>`;
+  if (g.what) h += `<div class="k">무엇을 탐지했나</div><p>${esc(g.what)}</p>`;
+  if (g.causes) h += `<div class="k">추정 원인</div><ul>${g.causes.map(c => `<li>${esc(c)}</li>`).join("")}</ul>`;
+  if (g.actions) h += `<div class="k">조치 가이드</div><ul>${g.actions.map(c => `<li>${esc(c)}</li>`).join("")}</ul>`;
+  if (g.false_positive) h += `<div class="k">오탐 가능성</div><p>${esc(g.false_positive)}</p>`;
+  if (f.evidence && f.evidence.length)
+    h += `<div class="k">근거 로그 (최대 ${f.evidence.length}건)</div><table class="ev"><tr><th>시각</th><th>IP</th><th>Method</th><th>URL</th><th>코드</th></tr>` +
+      f.evidence.map(e => `<tr><td class="mono">${esc(e.time)}</td><td class="mono">${esc(e.ip)}</td><td>${esc(e.method)}</td><td class="mono">${esc(e.url)}</td><td>${e.status || "-"}</td></tr>`).join("") + `</table>`;
+  return h + `</div>`;
+}
+
+async function toggleDetail(tr) {
+  const nx = tr.nextElementSibling;
+  if (nx && nx.classList.contains("dtl")) { nx.remove(); return; }
+  const d = await api("/api/ip?ip=" + encodeURIComponent(tr.dataset.ip));
+  const row = document.createElement("tr"); row.className = "dtl";
+  row.innerHTML = `<td colspan="5" class="detail"><div class="muted">User-Agent: <span class="mono">${esc(d.user_agent)}</span> · 응답코드 ${esc(d.statuses.map(([k, v]) => k + ":" + v).join(", "))}</div>
+    ${d.findings.map(findingHtml).join("")}</td>`;
+  tr.after(row);
+}
+
+const drop = $("drop"), fi = $("file");
+drop.onclick = () => fi.click();
+fi.onchange = () => { if (fi.files.length) upload([...fi.files]); fi.value = ""; };
+drop.ondragover = e => { e.preventDefault(); drop.classList.add("on"); };
+drop.ondragleave = () => drop.classList.remove("on");
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove("on"); if (e.dataTransfer.files.length) upload([...e.dataTransfer.files]); };
+$("reset").onclick = async () => { await api("/api/reset", {method: "POST"}); $("msg").textContent = ""; await refresh(); };
+init().catch(e => { $("msg").innerHTML = `<span class="err">${esc(e.message)}</span>`; });
+</script>
+</body>
+</html>
