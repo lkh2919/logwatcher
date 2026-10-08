@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -17,13 +18,17 @@ from . import VERSION, guide
 from . import config as config_mod
 from .analysis import analyze
 from .detector import LEVEL_LABEL, fmt_ts
+from .geoip import load_geo
 from .parser import LogReader
 from .resources import resource_path
 
 MODES = ("auto", "ip", "none")
-SORT_KEYS = ("level", "last", "first", "requests", "ip")
+# 최근 분석 결과를 보관해 범위를 되돌릴 때 다시 계산하지 않는다. 메모리를 아끼려고 IP가 많으면 적게 보관한다.
+CACHE_MAX_ENTRIES = 3
+CACHE_MAX_IPS = 300_000
+SORT_KEYS = ("level", "last", "first", "requests", "ip", "country")
 # 정렬 기준을 처음 고를 때의 기본 방향(날짜·건수·위험도는 큰 쪽부터, IP·첫 접근은 작은 쪽부터)
-DEFAULT_DIR = {"level": "desc", "last": "desc", "first": "asc", "requests": "desc", "ip": "asc"}
+DEFAULT_DIR = {"level": "desc", "last": "desc", "first": "asc", "requests": "desc", "ip": "asc", "country": "asc"}
 _LOCAL_HOSTS = ("127.0.0.1", "localhost")
 
 
@@ -49,7 +54,10 @@ class State:
     """
 
     def __init__(self, cfg=None, now_fn=time.time):
-        self.lock = threading.RLock()
+        self.lock = threading.RLock()                 # 파일 추가·분석처럼 오래 걸리는 일
+        self.set_lock = threading.Lock()              # 설정 변경(범위·모드·정렬): 분석 중에도 즉시 반영
+        self.version = 0                              # 설정이 바뀔 때마다 증가: 오래된 요청의 중복 분석을 건너뛰는 데 쓴다
+        self.gen = 0                                  # 파일이 바뀔 때마다 증가
         self.cfg = cfg if cfg is not None else config_mod.load()
         self.mode = self.cfg["ip_mode"] if self.cfg["ip_mode"] in MODES else "auto"
         self.days = max(0, int(self.cfg["recent_days"]))
@@ -65,8 +73,8 @@ class State:
             self.cleanup()
             self.entries = []
             self.hashes = set()
-            self._analysis = None
-            self._result = None
+            self.gen += 1
+            self._cache = OrderedDict()   # 키 -> 분석 결과 (최근 사용 순). 모드별 결과도 그 안에 함께 보관한다
 
     def cleanup(self):
         d, self.dir = self.dir, None
@@ -95,7 +103,8 @@ class State:
             self.hashes.add(digest)
             self.entries.append({"name": name, "reader": reader, "kind": reader.kind, "fmt": reader.fmt,
                                  "proxies": proxies, "info": info})
-            self._analysis = self._result = None
+            self.gen += 1
+            self._cache.clear()           # 파일이 바뀌면 이전 분석은 쓸 수 없다(메모리도 바로 반환)
             return self._file_view(len(self.entries) - 1)
 
     def _file_view(self, i):
@@ -104,31 +113,54 @@ class State:
         v = {"name": e["name"], "format_label": info["format_label"], "lines": info["lines"], "parsed": info["parsed"],
              "skipped": info["skipped"], "skipped_samples": info["skipped_samples"],
              "first": fmt_ts(info["first"]), "last": fmt_ts(info["last"])}
-        if self._analysis is not None:
-            v.update(self._analysis["per_file"][i])
+        an = self._current_analysis()
+        if an is not None and i < len(an["per_file"]):
+            v.update(an["per_file"][i])
         return v
 
     # ------------------------------------------------------------ 분석
+    def _key(self):
+        return (self.days, self.anchor, self.gen)
+
+    def _current_analysis(self):
+        """이미 계산된 분석 중 현재 설정과 파일 구성에 맞는 것(없으면 None). 계산은 하지 않는다."""
+        return self._cache.get(self._key())
+
     def analysis(self):
         with self.lock:
-            if self._analysis is None and self.entries:
-                self._analysis = analyze(self.entries, self.cfg, self.days, self.anchor, self.now_fn())
-            return self._analysis
+            if not self.entries:
+                return None
+            key = self._key()
+            an = self._cache.get(key)
+            if an is None:
+                an = analyze(self.entries, self.cfg, key[0], key[1], self.now_fn())
+                an["results"] = {}            # IP 구분 모드별로 만든 결과(분석과 함께 버려진다)
+                self._cache[key] = an
+                self._evict()
+            else:
+                self._cache.move_to_end(key)
+            return an
+
+    def _evict(self):
+        """오래 안 쓴 분석부터 버린다(가장 최근 것은 항상 남긴다)."""
+        while len(self._cache) > 1 and (len(self._cache) > CACHE_MAX_ENTRIES or
+                                        sum(len(a["analyzer"].ips) for a in self._cache.values()) > CACHE_MAX_IPS):
+            self._cache.popitem(last=False)
 
     def set_mode(self, mode):
-        with self.lock:
-            if mode not in MODES:
-                raise ValueError("bad mode")
+        if mode not in MODES:
+            raise ValueError("bad mode")
+        with self.set_lock:
             self.mode = mode
-            self._result = None
+            self.version += 1
 
     def set_sort(self, key=None, direction=None, ev=None):
-        """IP 목록 정렬(key: level/last/first/requests/ip, direction: asc/desc)과 근거 로그 시각순(ev: asc/desc)."""
-        with self.lock:
-            if key is not None and key not in SORT_KEYS:
-                raise ValueError("bad sort key")
-            if direction not in (None, "asc", "desc") or ev not in (None, "asc", "desc"):
-                raise ValueError("bad sort direction")
+        """IP 목록 정렬(key: level/last/first/requests/ip/country, direction: asc/desc)과 근거 로그 시각순(ev: asc/desc)."""
+        if key is not None and key not in SORT_KEYS:
+            raise ValueError("bad sort key")
+        if direction not in (None, "asc", "desc") or ev not in (None, "asc", "desc"):
+            raise ValueError("bad sort direction")
+        with self.set_lock:
             if key is not None:
                 self.sort_key = key
                 self.sort_dir = direction or DEFAULT_DIR[key]
@@ -136,6 +168,14 @@ class State:
                 self.sort_dir = direction
             if ev is not None:
                 self.ev_dir = ev
+            self.version += 1
+
+    def set_days(self, days):
+        if not 0 <= days <= 3650:
+            raise ValueError("bad days")
+        with self.set_lock:
+            self.days = days
+            self.version += 1
 
     def sorted_ips(self, ips):
         """화면과 CSV가 같은 순서를 쓰도록 정렬 기준을 한 곳에서 적용한다."""
@@ -146,6 +186,8 @@ class State:
             return sorted(ips, key=lambda x: (x["requests"], x["level"], x["score"]), reverse=desc)
         if key == "ip":
             return sorted(ips, key=lambda x: _ip_sort_key(x["ip"]), reverse=desc)
+        if key == "country":
+            return sorted(ips, key=lambda x: (x.get("country_name", ""), x["level"], x["score"]), reverse=desc)
         present = [x for x in ips if x[key]]           # first/last: 접근 기록이 없는(에러로그에만 나온) IP는 항상 맨 뒤
         present.sort(key=lambda x: (x[key], x["level"], x["score"]), reverse=desc)
         return present + [x for x in ips if not x[key]]
@@ -155,25 +197,36 @@ class State:
         desc = self.ev_dir == "desc"
         return [dict(f, evidence=sorted(f["evidence"], key=lambda e: e["ts"], reverse=desc)) for f in findings]
 
-    def set_days(self, days):
-        with self.lock:
-            if not 0 <= days <= 3650:
-                raise ValueError("bad days")
-            self.days = days
-            self._analysis = self._result = None
-
     def result(self):
         with self.lock:
             an = self.analysis()
-            if self._result is None and an is not None:
-                self._result = an["analyzer"].result(self.mode)
-            return self._result
+            if an is None:
+                return None
+            res = an["results"].get(self.mode)
+            if res is None:
+                res = an["results"][self.mode] = an["analyzer"].result(self.mode)
+            return res
 
     def _range(self, an):
+        firsts = [e["info"]["first"] for e in self.entries if e["info"]["first"] is not None]
+        lasts = [e["info"]["last"] for e in self.entries if e["info"]["last"] is not None]
+        log_first = min(firsts) if firsts else None
         return {"days": self.days, "anchor": self.anchor, "from": fmt_ts(an["cutoff"]) if an["cutoff"] is not None else "",
-                "to": fmt_ts(an["anchor"]), "excluded": an["excluded"], "in_range": an["in_range"]}
+                "to": fmt_ts(an["anchor"]), "excluded": an["excluded"], "in_range": an["in_range"],
+                "log_from": fmt_ts(log_first), "log_to": fmt_ts(max(lasts)) if lasts else "",
+                # 선택한 범위가 올린 로그의 전체 기간보다 길어서 범위를 바꿔도 결과가 같은 경우
+                "covers_all": an["cutoff"] is None or (log_first is not None and an["cutoff"] <= log_first)}
 
-    def summary(self):
+    def summary(self, expect_version=None):
+        """expect_version이 주어졌는데 그 사이 설정이 또 바뀌었으면 계산하지 않고 {"stale": True}를 돌려준다."""
+        with self.lock:
+            if expect_version is not None and expect_version != self.version:
+                return {"stale": True, "version": self.version}
+            out = self._summary()
+            out["version"] = self.version
+            return out
+
+    def _summary(self):
         with self.lock:
             an = self.analysis()
             if an is None:
@@ -193,13 +246,16 @@ class State:
                 "reason": res["reason"], "verdict": res["verdict"],
                 # 목록에는 근거 로그를 싣지 않는다(상세 조회 때만). 요청 단위 모드는 항목 수가 적어 포함.
                 "ips": [self._ip_row(x) for x in self.sorted_ips(res["ips"])],
+                "countries": res["countries"], "geo": res["geo"], "home_countries": res.get("home_countries", []),
+                "foreign_omitted": res["foreign_omitted"], "foreign_ips": res["foreign_ips"],
                 "findings": self.ordered_findings(res["findings"]),
                 "sort": {"key": self.sort_key, "dir": self.sort_dir, "ev": self.ev_dir},
             }
 
     @staticmethod
     def _ip_row(x):
-        return {"ip": x["ip"], "level": x["level"], "level_label": x["level_label"], "score": x["score"],
+        return {"ip": x["ip"], "country": x.get("country", ""), "country_name": x.get("country_name", ""),
+                "foreign": x.get("foreign", False), "level": x["level"], "level_label": x["level_label"], "score": x["score"],
                 "requests": x["requests"], "errors": x["errors"], "first": x["first"], "last": x["last"],
                 "success_warn": x["success_warn"], "user_agent": x["user_agent"], "is_proxy": x["is_proxy"],
                 "findings": [{"key": f["key"], "label": f["label"], "level": f["level"],
@@ -219,9 +275,9 @@ class State:
             buf = io.StringIO()
             w = csv.writer(buf)
             if res["mode"] == "ip":
-                w.writerow(["위험도", "IP", "요청수", "탐지 내용", "정상응답 경고", "첫 접근", "마지막 접근", "User-Agent"])
+                w.writerow(["위험도", "IP", "국가", "요청수", "탐지 내용", "정상응답 경고", "첫 접근", "마지막 접근", "User-Agent"])
                 for x in self.sorted_ips(res["ips"]):
-                    w.writerow([x["level_label"], csv_safe(x["ip"]), x["requests"],
+                    w.writerow([x["level_label"], csv_safe(x["ip"]), x.get("country_name", ""), x["requests"],
                                 csv_safe(" / ".join("%s(%s)" % (f["label"], f["desc"]) for f in x["findings"])),
                                 "Y" if x["success_warn"] else "", x["first"], x["last"], csv_safe(x["user_agent"])])
             else:
@@ -285,7 +341,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/favicon.ico":
                 return self._send(204, b"", "image/x-icon")
             if path == "/api/status":
-                return self._send(200, {"version": VERSION, "config": STATE.cfg, "level_guide": guide.LEVEL_GUIDE,
+                geo = load_geo(STATE.cfg)
+                return self._send(200, {"version": VERSION, "config": STATE.cfg, "geo": {"available": geo.available, "source": geo.source}, "level_guide": guide.LEVEL_GUIDE,
                                         "level_notes": guide.LEVEL_NOTES, "rules": guide.RULES,
                                         "success_warn": guide.SUCCESS_WARN_KEYS})
             if path == "/api/summary":
@@ -314,16 +371,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True})
             if path == "/api/mode":
                 STATE.set_mode(q.get("mode", ""))
-                return self._send(200, {"ok": True})
+                return self._send(200, STATE.summary(STATE.version))
             if path == "/api/sort":
                 STATE.set_sort(q.get("key"), q.get("dir"), q.get("ev"))
-                return self._send(200, {"ok": True})
+                return self._send(200, STATE.summary(STATE.version))
             if path == "/api/range":
                 try:
                     STATE.set_days(int(q.get("days", "")))
                 except (TypeError, ValueError):
                     raise ValueError("bad days")
-                return self._send(200, {"ok": True})
+                return self._send(200, STATE.summary(STATE.version))
             return self._send(404, {"error": "not found"})
         except ValueError as e:
             return self._send(400, {"error": str(e)})
