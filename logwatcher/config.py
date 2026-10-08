@@ -14,10 +14,14 @@ DEFAULTS = {
     "trusted_proxies": [],
     # X-Forwarded-For가 로그에 있으면 실제 접속자 IP로 사용
     "use_xff": True,
+    # 공인 IP의 LB라도 요청 대부분에 X-Forwarded-For를 붙여 보내면 프록시로 자동 판단(화면에 표시됨)
+    "auto_proxy": True,
     # 취약경로 탐색 규칙에서 제외할 요청 경로(정규식). 예: ["^/graphql", "^/swagger"]
     "probe_ignore_paths": [],
     # 정상으로 보는 HTTP Method
     "allowed_methods": ["GET", "POST", "HEAD", "OPTIONS"],
+    # REST API에서 흔한 Method: 비정상 Method(중간)가 아니라 '낮음'으로 표시. 정상 서비스면 allowed_methods로 옮기세요
+    "rest_methods": ["PUT", "DELETE", "PATCH"],
     # 접속량 계산에서 제외할 정적 파일 확장자
     "static_extensions": [
         "css", "js", "map", "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "bmp",
@@ -40,6 +44,10 @@ DEFAULTS = {
     "login_post_max": 20,
     # 화면 표시 시간대(KST=9)
     "display_utc_offset_hours": 9,
+    # nginx error.log 기록 시간대(시간대 표기가 없는 로그라 서버 로컬 시간 기준, KST=9)
+    "error_log_utc_offset_hours": 9,
+    # HAProxy 로그의 접속 시각(시간대 표기 없음) 기록 시간대(서버 로컬 시간 기준, KST=9)
+    "haproxy_log_utc_offset_hours": 9,
 }
 
 CONFIG_FILE = "config.json"

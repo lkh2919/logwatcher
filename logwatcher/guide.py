@@ -25,7 +25,7 @@ LEVEL_NOTES = [
 SUCCESS_WARN_KEYS = ["sqli", "xss", "traversal", "cmdi", "probe"]
 
 # IP를 구분할 수 없을 때(요청 단위 판정)에도 쓸 수 있는 규칙 (나머지는 IP별 집계가 필요)
-REQUEST_LEVEL_KEYS = ["sqli", "xss", "traversal", "cmdi", "probe", "scanner", "method", "malformed"]
+REQUEST_LEVEL_KEYS = ["sqli", "xss", "traversal", "cmdi", "probe", "scanner", "method", "method_rest", "malformed", "errlog"]
 
 RULES = {
     "sqli": {
@@ -83,6 +83,13 @@ RULES = {
         "actions": ["응답코드가 2xx인지 확인하세요. nginx가 해당 Method를 막고 있는지 설정을 점검하세요."],
         "false_positive": "REST API가 PUT/DELETE/PATCH를 정상 사용하는 경우. config.json의 allowed_methods에 추가하세요.",
     },
+    "method_rest": {
+        "label": "REST Method(PUT/DELETE/PATCH)", "level": 1,
+        "what": "PUT, DELETE, PATCH 요청입니다. REST API를 쓰는 서비스에서는 정상이지만, 파일 업로드(PUT)·삭제 시도에 쓰일 수도 있습니다.",
+        "causes": ["애플리케이션의 정상 API 호출(비밀번호 변경, 수정/삭제 등)", "파일 업로드·웹쉘 설치 시도(PUT /x.jsp 등)"],
+        "actions": ["요청 경로가 서비스의 정상 API인지 확인하세요. 정적 파일 경로나 확장자(.jsp/.php)로 PUT이 오면 의심하세요."],
+        "false_positive": "REST API를 쓰는 서비스에서는 대부분 정상입니다. config.json의 allowed_methods에 추가하면 표시되지 않습니다.",
+    },
     "malformed": {
         "label": "깨진/바이너리 요청", "level": 1,
         "what": "HTTP 형식이 아닌 데이터가 들어왔습니다. 예: HTTP 포트(80)로 HTTPS(TLS) 연결 시도.",
@@ -121,10 +128,10 @@ RULES = {
     },
     "login_fail": {
         "label": "로그인 실패/오류 반복", "level": 2,
-        "what": "로그인 관련 URL에서 에러 응답(4xx/5xx)이 반복됐습니다. (기본: 5건 이상)",
+        "what": "로그인 관련 URL에서 인증 실패 응답(400·401·403·422·429)이 반복됐습니다. (기본: 5건 이상) 서버 오류(5xx)는 장애일 수 있어 세지 않습니다.",
         "causes": ["비밀번호 무차별 대입, 계정 정보 대입(Credential Stuffing)"],
         "actions": ["애플리케이션 로그에서 해당 시간대의 로그인 실패 계정을 확인하세요.", "계정 잠금·CAPTCHA 적용 여부를 점검하고 IP를 차단하세요."],
-        "false_positive": "사용자가 비밀번호를 여러 번 틀린 경우.",
+        "false_positive": "사용자가 비밀번호를 여러 번 틀린 경우, 또는 로그인 URL을 폴링하는 정상 클라이언트.",
     },
     "login_burst": {
         "label": "로그인 시도 과다", "level": 2,
@@ -132,6 +139,13 @@ RULES = {
         "causes": ["무차별 대입 공격 자동화"],
         "actions": ["로그인 성공(200/302) 응답이 섞여 있는지, 해당 IP를 차단해야 하는지 확인하세요."],
         "false_positive": "공용 IP(회사 NAT)에서 다수 사용자가 로그인한 경우.",
+    },
+    "errlog": {
+        "label": "에러로그 의심 요청", "level": 1,
+        "what": "nginx error.log에 남은 보안 관련 기록입니다. 예: 잘못된 Method(프로토콜 스캔), 요청 제한(limit_req) 초과, 접근 거부 규칙, 인증 실패, 에러가 난 요청 URL의 공격 패턴.",
+        "causes": ["HTTP 포트에 다른 프로토콜(SMB, Redis, JDWP 등)을 보내 열린 서비스를 찾는 포트 스캔", "공격·탐색 요청이 서버 오류를 일으킨 경우"],
+        "actions": ["같은 IP가 접근 로그에서도 탐지됐는지 함께 확인하세요.", "반복되면 해당 IP를 차단하세요."],
+        "false_positive": "HTTP 포트를 혼동한 정상 클라이언트나 점검 도구.",
     },
     "script": {
         "label": "스크립트/도구 접근", "level": 1,
@@ -141,3 +155,44 @@ RULES = {
         "false_positive": "내부 연동·점검 도구. allow_ips에 등록하세요.",
     },
 }
+
+# 프로토콜 스캔 식별: 요청 줄 앞부분(대소문자 구분 없음) -> 표시 이름
+PROTO_HINTS = [
+    ("JDWP-Handshake", "JDWP(Java 디버그)"), ("JRMI", "Java RMI"), ("SMBr", "SMB"), ("\\xffSMB", "SMB"),
+    ("admin.$cmd", "MongoDB"), ("MGLNDD", "포트스캔(MGLNDD)"), ("\\x16\\x03", "TLS(HTTPS)"),
+    ("*1", "Redis"), ("*2", "Redis"), ("*3", "Redis"), ("SSH-", "SSH"), ("\\x03\\x00\\x00", "RDP"),
+    ("CONNECT", "프록시 터널(CONNECT)"), ("\\x00\\x00\\x00", "바이너리 프로토콜"),
+]
+
+# nginx error.log 분류: (key, 정규식, 종류, 표시 이름, 설명, 조치)
+# 종류: noise=연결 종료 등 무시 / sec=보안 신호(낮음) / sec2=보안 신호(중간) / ops=서버 상태 참고 / nf=파일 없음(404 유사)
+ERR_RULES = [
+    ("hap_down", r"Server \S+ is DOWN|backend \S+ has no server available", "ops", "백엔드 서버 다운(HAProxy)",
+     "HAProxy 상태 점검이 실패해 백엔드(nginx 등) 서버를 제외했거나, 사용할 수 있는 서버가 없는 상태입니다. 이 시간대에는 서비스 접속이 실패했을 수 있습니다.",
+     "해당 시각 전후로 백엔드 서버(nginx, 애플리케이션) 프로세스와 포트 상태, 재배포·재시작 이력을 확인하세요."),
+    ("hap_up", r"Server \S+ is UP", "ops", "백엔드 서버 복구(HAProxy)", "상태 점검이 통과해 백엔드 서버가 다시 투입됐습니다.", ""),
+    ("hap_stop", r"Proxy \S+ .*(stopped|started)|^Stopping|^Pausing", "ops", "HAProxy 프록시 시작/중지",
+     "HAProxy가 재시작되거나 중지됐습니다. reload 중이면 정상이지만, 예정에 없던 중지라면 확인이 필요합니다.", "작업 이력(설정 변경, 배포)과 맞는지 확인하세요."),
+    ("hap_ssl", r"SSL handshake failure \(HAProxy\)", "sec", "TLS 핸드셰이크 실패(HAProxy)", "", ""),
+    ("closed", r"closed connection while waiting for request|closed keepalive connection|prematurely closed connection|"
+               r"client timed out|recv\(\) failed \(10[04]|epoll_wait\(\) reported that client prematurely",
+     "noise", "연결 종료(정상 범주)", "", ""),
+    ("bad_method", r"client sent invalid (method|request)|client sent HTTP/1\.\d request without|"
+                   r"client sent plain HTTP request to HTTPS port|SSL_do_handshake\(\) failed|"
+                   r"no \"ssl_certificate\" is defined|client sent too long|client sent invalid header",
+     "sec", "잘못된 요청(프로토콜 스캔 등)", "", ""),
+    ("limit", r"limiting (requests|connections)", "sec2", "요청/연결 제한 초과(limit_req)", "", ""),
+    ("forbidden", r"access forbidden by rule|directory index of .* is forbidden", "sec2", "접근 거부 규칙에 걸림", "", ""),
+    ("auth", r"user \".*\" (was not found|password mismatch)|no user/password was provided", "sec2",
+     "기본 인증 실패", "", ""),
+    ("perm", r"open\(\) \".*\" failed \((13|24|28)\b", "ops", "파일 열기 실패(권한/한도/디스크)",
+     "nginx가 파일을 열지 못했습니다. 로그 파일을 logrotate로 교체한 뒤 소유자·권한이 맞지 않을 때 주로 발생하며, 이 경우 이후 로그가 기록되지 않을 수 있습니다.",
+     "해당 경로의 소유자/권한이 nginx 실행 계정과 맞는지 확인하고(로그 파일이면 logrotate `create` 설정), 로그가 계속 쌓이는지 점검하세요."),
+    ("upstream", r"upstream (timed out|prematurely closed|sent|server temporarily disabled)|connect\(\) failed .*upstream|"
+                 r"no live upstreams|connect\(\) to .* failed", "ops", "업스트림(백엔드) 오류",
+     "nginx가 뒤쪽 애플리케이션 서버와 통신하지 못했습니다.", "백엔드 서비스 상태와 타임아웃 설정을 확인하세요."),
+    ("conn", r"worker_connections are not enough|too many open files|socket\(\) failed|bind\(\) .* failed|"
+             r"No space left", "ops", "서버 자원 부족/포트 오류",
+     "연결 수·파일 핸들·디스크 같은 자원이 부족합니다.", "worker_connections, ulimit, 디스크 여유 공간을 확인하세요."),
+    ("notfound", r"open\(\) \".*\" failed \(2: No such file", "nf", "파일 없음(404 유사)", "", ""),
+]

@@ -37,6 +37,7 @@ class State:
         with self.lock:
             self.analyzer = Analyzer(self.cfg)
             self.files = []
+            self.formats = set()
             self.hashes = set()
             self._result = None
 
@@ -45,15 +46,25 @@ class State:
             if digest in self.hashes:
                 return {"name": name, "error": "이미 추가된 파일과 내용이 같아서 건너뛰었습니다."}
             try:
-                reader = LogReader(tmp_path, self.cfg["display_utc_offset_hours"])
+                reader = LogReader(tmp_path, self.cfg["display_utc_offset_hours"],
+                                   self.cfg["error_log_utc_offset_hours"], self.cfg["haproxy_log_utc_offset_hours"])
             except ValueError as e:
                 return {"name": name, "error": str(e)}
+            a = self.analyzer
+            if reader.kind == "access":
+                a.register_proxies(reader.scan_proxies())   # LB/프록시 자동 판별(파일을 한 번 더 훑음)
+
+                def feed(rec):      # HAProxy 로그의 상태 줄은 에러로그 형식(길이 6)으로 온다
+                    a.feed_error(rec) if len(rec) == 6 else a.feed(rec)
+            else:
+                feed = a.feed_error
             for rec in reader.records():
-                self.analyzer.feed(rec)
+                feed(rec)
             i = reader.info
             if i["parsed"] == 0:
                 return {"name": name, "error": "읽을 수 있는 로그 줄이 없습니다. 형식을 확인하세요."}
             self.hashes.add(digest)
+            self.formats.add(i["format"])
             self._result = None
             view = {"name": name, "format_label": i["format_label"], "lines": i["lines"], "parsed": i["parsed"],
                     "skipped": i["skipped"], "skipped_samples": i["skipped_samples"],
@@ -76,16 +87,15 @@ class State:
 
     def summary(self):
         with self.lock:
-            if not self.analyzer.total:
+            if not (self.analyzer.total or self.analyzer.err_total):
                 return {"files": self.files, "empty": True, "mode_setting": self.mode}
             res = self.result()
             a = self.analyzer
-            firsts = [x.first for x in a.ips.values() if x.first is not None]
-            lasts = [x.last for x in a.ips.values() if x.last is not None]
             return {
                 "files": self.files, "empty": False, "total": a.total, "allowed_skipped": a.allowed_skipped,
                 "unique_ips": res["distinct_ips"], "xff_used": res["xff_used"],
-                "period": [fmt_ts(min(firsts)) if firsts else "", fmt_ts(max(lasts)) if lasts else ""],
+                "period": [fmt_ts(a.first_ts), fmt_ts(a.last_ts)],
+                "auto_proxies": res["auto_proxies"], "errorlog": res["errorlog"], "warnings": self._warnings(),
                 "mode": res["mode"], "mode_setting": self.mode, "unreliable": res["unreliable"],
                 "reason": res["reason"], "verdict": res["verdict"],
                 # 목록에는 근거 로그를 싣지 않는다(상세 조회 때만). 요청 단위 모드는 항목 수가 적어 포함.
@@ -93,17 +103,24 @@ class State:
                 "findings": res["findings"],
             }
 
+    def _warnings(self):
+        w = []
+        if "haproxy" in self.formats and self.formats - {"haproxy", "nginx_error"}:
+            w.append("HAProxy 로그와 nginx 접근 로그가 함께 올라와 같은 요청이 두 번 집계될 수 있습니다. "
+                     "건수 기준 탐지(과다 접속, 에러 다수 등)가 부풀려질 수 있으니 한쪽만 올리는 것을 권합니다.")
+        return w
+
     @staticmethod
     def _ip_row(x):
         return {"ip": x["ip"], "level": x["level"], "level_label": x["level_label"], "score": x["score"],
                 "requests": x["requests"], "errors": x["errors"], "first": x["first"], "last": x["last"],
-                "success_warn": x["success_warn"], "user_agent": x["user_agent"],
+                "success_warn": x["success_warn"], "user_agent": x["user_agent"], "is_proxy": x["is_proxy"],
                 "findings": [{"key": f["key"], "label": f["label"], "level": f["level"],
                               "success": f["success"]} for f in x["findings"]]}
 
     def ip_detail(self, ip):
         with self.lock:
-            if not self.analyzer.total:
+            if not (self.analyzer.total or self.analyzer.err_total):
                 return None
             return next((x for x in self.result()["ips"] if x["ip"] == ip), None)
 

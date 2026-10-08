@@ -20,7 +20,7 @@ def main():
     httpd = make_server(PORTS)
     url = "http://127.0.0.1:%d/" % httpd.server_address[1]
     _say("=" * 60)
-    _say(" LogWatcher %s - nginx 위협 로그 점검" % VERSION)
+    _say(" LogWatcher %s - nginx·HAProxy 위협 로그 점검" % VERSION)
     _say("=" * 60)
     _say(" 화면 주소 : %s" % url)
     _say(" 브라우저가 자동으로 열리지 않으면 위 주소를 직접 여세요.")

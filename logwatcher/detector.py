@@ -13,7 +13,7 @@ from collections import Counter
 from urllib.parse import unquote_plus
 
 from . import guide
-from .parser import IP, METHOD, PATH, QUERY, STATUS, TS, UA, XFF
+from .parser import IP, METHOD, PATH, QUERY, STATUS, TS, UA, XFF, _split_request
 
 HIGH, MEDIUM, LOW = 3, 2, 1
 LEVEL_LABEL = {HIGH: "높음", MEDIUM: "중간", LOW: "낮음", 0: "-"}
@@ -81,6 +81,8 @@ SCRIPT_UA = re.compile(
     r"python-requests|python-urllib|aiohttp|curl/|wget/|go-http-client|libwww-perl|java/\d|"
     r"okhttp|httpclient|axios/|node-fetch|powershell|winhttp", re.I)
 
+_AUTH_FAIL = frozenset((400, 401, 403, 422, 429))
+_EXEC_EXT = re.compile(r"\.(jsp|jspx|php\d?|phtml|asp|aspx|cgi|pl|sh|exe|war)$", re.I)
 _HEX_ESC = re.compile(r"\\x([0-9A-Fa-f]{2})")
 
 
@@ -185,6 +187,28 @@ def _is_static(path, static_ext):
     return path[dot:].lower() in static_ext
 
 
+def _proto_hint(method, path):
+    """깨진 요청이 어떤 프로토콜을 노린 것인지 추정한다."""
+    if method == "(TLS)":
+        return "TLS(HTTPS)"
+    head = path[:60]
+    low = head.lower()
+    for pref, name in guide.PROTO_HINTS:
+        if (head.startswith(pref) if pref.startswith("*") else pref.lower() in low):
+            return name
+    return "기타"
+
+
+def _extra_text(h, n=4):
+    if not h.extra:
+        return ""
+    return " (" + ", ".join("%s %d건" % kv for kv in sorted(h.extra.items(), key=lambda kv: -kv[1])[:n]) + ")"
+
+
+_ERR_RANK = {"emerg": 0, "alert": 1, "crit": 2, "error": 3, "warn": 4, "notice": 5, "info": 6, "debug": 7}
+_ERR_OPS_LEVELS = ("emerg", "alert", "crit", "error")
+
+
 def fmt_ts(ts):
     import time
     return "" if ts is None else time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts))
@@ -192,7 +216,7 @@ def fmt_ts(ts):
 
 class _Hit:
     """규칙 하나의 누적 결과(건수, 2xx 응답 수, 상태코드 분포, 근거 로그)."""
-    __slots__ = ("count", "success", "status", "rows", "ips", "first_ua")
+    __slots__ = ("count", "success", "status", "rows", "ips", "level", "extra")
 
     def __init__(self):
         self.count = 0
@@ -200,7 +224,8 @@ class _Hit:
         self.status = Counter()
         self.rows = []
         self.ips = set()
-        self.first_ua = ""
+        self.level = 0       # 0이면 규칙 기본 등급 사용
+        self.extra = {}      # 세부 분류(예: 프로토콜 이름) -> 건수
 
 
 class _IpAcc:
@@ -239,6 +264,7 @@ class Analyzer:
         self.allow = IpMatcher(cfg["allow_ips"])
         self.trusted = IpMatcher(cfg["trusted_proxies"])
         self.allowed_methods = set(m.upper() for m in cfg["allowed_methods"])
+        self.rest_methods = set(m.upper() for m in cfg["rest_methods"])
         self.static_ext = set("." + e.lower().lstrip(".") for e in cfg["static_extensions"])
         self.login_re = re.compile(cfg["login_url_pattern"], re.I) if cfg["login_url_pattern"] else None
         self.ignore_re = [re.compile(p) for p in cfg["probe_ignore_paths"] if p]
@@ -251,17 +277,39 @@ class Analyzer:
         self.xff_used = 0
         self.ips = {}
         self.glob = {}                # 요청 단위 집계 (IP 구분 불가 모드용)
+        self.auto_proxies = {}        # 자동 판별된 LB/프록시 IP -> 요청 수
+        self.first_ts = self.last_ts = None
+        # 에러로그
+        self._err_rules = [(k, re.compile(rx, re.I), kind, label, what, act) for k, rx, kind, label, what, act in guide.ERR_RULES]
+        self.err_total = 0
+        self.err_levels = {}
+        self.err_noise = 0
+        self.err_sec = 0
+        self.ops = {}
 
     # ------------------------------------------------------------ 입력
     def _is_proxy(self, ip):
         v = self._trust_cache.get(ip)
         if v is None:
             a = _valid_ip(ip)
-            v = bool(a and is_internal(a)) or ip in self.trusted
+            v = bool(a and is_internal(a)) or ip in self.trusted or ip in self.auto_proxies
             if len(self._trust_cache) > 100000:
                 self._trust_cache.clear()
             self._trust_cache[ip] = v
         return v
+
+    def register_proxies(self, stats):
+        """파일 하나의 접속 IP 통계(parser.LogReader.scan_proxies)로 LB/프록시를 자동 판별한다.
+
+        요청 20건 이상, 90% 이상에 X-Forwarded-For가 붙고 값이 3종류 이상이면 프록시로 본다.
+        화면에 목록을 보여주며 config.json의 auto_proxy=false로 끌 수 있다.
+        """
+        if not self.cfg.get("auto_proxy", True):
+            return
+        for ip, (n, nx, xs) in stats.items():
+            if n >= 20 and nx / n >= 0.9 and len(xs) >= 3 and _valid_ip(ip) is not None and not self._is_proxy(ip):
+                self.auto_proxies[ip] = n
+        self._trust_cache.clear()
 
     def client_ip(self, rec):
         """접속 IP. 프록시가 보낸 X-Forwarded-For는 요청이 신뢰하는 프록시에서 왔을 때만 사용한다."""
@@ -321,6 +369,7 @@ class Analyzer:
             h.rows.append(row)
         if ip is not None and len(h.ips) < 2000:
             h.ips.add(ip)
+        return h
 
     def feed(self, rec):
         self.total += 1
@@ -329,6 +378,10 @@ class Analyzer:
             self.allowed_skipped += 1
             return
         ts, method, path, query, status, ua = rec[TS], rec[METHOD], rec[PATH], rec[QUERY], rec[STATUS], rec[UA]
+        if self.first_ts is None or ts < self.first_ts:
+            self.first_ts = ts
+        if self.last_ts is None or ts > self.last_ts:
+            self.last_ts = ts
         a = self.ips.get(ip)
         if a is None:
             a = self.ips[ip] = _IpAcc()
@@ -349,10 +402,12 @@ class Analyzer:
             if ua in m or len(m) < 9:
                 m[ua] = m.get(ua, 0) + 1
 
-        kind = self._attack_kind(path, query) if path or query else ""
+        proto_probe = method in ("(TLS)", "(INVALID)")   # HTTP가 아닌 데이터: URL 패턴 검사 대상이 아님
+        kind = self._attack_kind(path, query) if (path or query) and not proto_probe else ""
         uk = _ua_kind(ua) if ua else ""
-        bad_method = method in ("(TLS)", "(INVALID)") or (method != "-" and method not in self.allowed_methods)
-        is_err = status >= 400 and status != 499
+        bad_method = proto_probe or (method != "-" and method not in self.allowed_methods)
+        # 프로토콜 스캔의 400 응답은 '깨진/바이너리 요청'으로 이미 집계하므로 에러 다수 규칙에서는 뺀다
+        is_err = status >= 400 and status != 499 and not proto_probe
         is_404 = status == 404 and (a.nf is None or (path not in a.nf and len(a.nf) < 1000))
         dynamic = not _is_static(path, self.static_ext)
         login = dynamic and self.login_re is not None and self.login_re.search(path) is not None
@@ -375,9 +430,18 @@ class Analyzer:
             if len(a.script_rows) < SOFT_MAX:
                 a.script_rows.append(row)
         if bad_method:
-            key = "malformed" if method in ("(TLS)", "(INVALID)") else "method"
-            self._hit(a, key, row, status)
-            self._hit(self.glob, key, row, status, ip)
+            if proto_probe:
+                key = "malformed"
+            elif method in self.rest_methods and not _EXEC_EXT.search(path):
+                key = "method_rest"      # PUT/DELETE/PATCH: API라면 정상. 실행 파일 확장자로 오면 업로드 시도라 '비정상 Method'
+            else:
+                key = "method"
+            h1 = self._hit(a, key, row, status)
+            h2 = self._hit(self.glob, key, row, status, ip)
+            if key == "malformed":
+                hint = _proto_hint(method, path)
+                h1.extra[hint] = h1.extra.get(hint, 0) + 1
+                h2.extra[hint] = h2.extra.get(hint, 0) + 1
 
         # 이하는 IP별 집계가 있어야 의미 있는 규칙
         if dynamic:
@@ -395,7 +459,7 @@ class Analyzer:
                 a.nf = {}
             a.nf[path] = row
         if login:
-            if is_err:
+            if status in _AUTH_FAIL:      # 5xx는 서버 장애일 가능성이 커서 인증 실패로 세지 않는다
                 a.login_fail += 1
                 if a.login_rows is None:
                     a.login_rows = []
@@ -405,6 +469,69 @@ class Analyzer:
                 if a.login_post is None:
                     a.login_post = array("q")
                 a.login_post.append(ts)
+
+    # ------------------------------------------------------------ 에러로그
+    def feed_error(self, rec):
+        ts, level, ip, core, req, _server = rec
+        self.err_total += 1
+        self.err_levels[level] = self.err_levels.get(level, 0) + 1
+        if self.first_ts is None or ts < self.first_ts:
+            self.first_ts = ts
+        if self.last_ts is None or ts > self.last_ts:
+            self.last_ts = ts
+        rkey, kind, label, what, actions = "other", "other", "기타", "", ""
+        for k, rx, kd, lb, wh, ac in self._err_rules:
+            if rx.search(core):
+                rkey, kind, label, what, actions = k, kd, lb, wh, ac
+                break
+        if kind == "other" and level in _ERR_OPS_LEVELS:
+            kind, label = "ops", "기타 오류"
+            rkey = "other:" + re.sub(r"\d+", "N", core)[:80]
+        if kind == "ops":
+            o = self.ops.get(rkey)
+            if o is None and len(self.ops) < 60:
+                o = self.ops[rkey] = {"label": label, "level": level, "count": 0, "first": ts, "last": ts,
+                                      "sample": core[:200], "what": what, "actions": actions}
+            if o is not None:
+                o["count"] += 1
+                o["first"], o["last"] = min(o["first"], ts), max(o["last"], ts)
+                if _ERR_RANK.get(level, 9) < _ERR_RANK.get(o["level"], 9):
+                    o["level"] = level
+            return
+        # 요청 URL에 공격 패턴이 있으면 연결 종료 같은 항목도 보안 신호로 본다
+        atk = ""
+        if req:
+            _m, path, query = _split_request(req)
+            atk = self._attack_kind(path, query) if path or query else ""
+        if kind in ("noise", "nf", "other") and not atk:
+            self.err_noise += 1
+            return
+        self.err_sec += 1
+        ev_level = MEDIUM if (kind == "sec2" or atk) else LOW
+        tag = label if not atk else "%s 패턴(%s)" % (guide.RULES[atk]["label"], label)
+        row = (ts, ip, "(ERR)", (req or core)[:URL_MAX], 0, tag)
+        targets = [(self.glob, ip or None)]
+        if ip and not (self.has_allow and ip in self.allow):
+            a = self.ips.get(ip)
+            if a is None:
+                a = self.ips[ip] = _IpAcc()
+            if a.first is None or ts < a.first:
+                a.first = ts
+            if a.last is None or ts > a.last:
+                a.last = ts
+            targets.append((a, None))
+        for store, ipv in targets:
+            h = self._hit(store, "errlog", row, 0, ipv)
+            h.level = max(h.level, ev_level)
+            h.extra[tag] = h.extra.get(tag, 0) + 1
+
+    def error_summary(self):
+        if not self.err_total:
+            return None
+        ops = sorted(self.ops.values(), key=lambda o: (_ERR_RANK.get(o["level"], 9), -o["count"]))
+        return {"total": self.err_total, "levels": dict(sorted(self.err_levels.items(), key=lambda kv: _ERR_RANK.get(kv[0], 9))),
+                "noise": self.err_noise, "security": self.err_sec,
+                "ops": [dict(o, first=fmt_ts(o["first"]), last=fmt_ts(o["last"])) for o in ops]}
 
     # ------------------------------------------------------------ 모드 판별
     def mode_info(self):
@@ -445,7 +572,7 @@ class Analyzer:
                 "evidence": [_row_dict(r) for r in rows]}
 
     def _hit_finding(self, key, h, desc):
-        return self._finding(key, guide.RULES[key]["level"], desc, h.count, h.success, h.status, h.rows)
+        return self._finding(key, h.level or guide.RULES[key]["level"], desc, h.count, h.success, h.status, h.rows)
 
     def _ip_result(self, ip, a):
         cfg = self.cfg
@@ -454,7 +581,7 @@ class Analyzer:
         for key in guide.REQUEST_LEVEL_KEYS:
             h = hits.get(key)
             if h:
-                fs.append(self._hit_finding(key, h, "%s %d건" % (guide.RULES[key]["label"], h.count)))
+                fs.append(self._hit_finding(key, h, "%s %d건%s" % (guide.RULES[key]["label"], h.count, _extra_text(h))))
         if "scanner" not in hits and a.script_n >= max(5, a.n // 2):
             rows = a.script_rows or []
             fs.append(self._finding("script", LOW, "브라우저가 아닌 프로그램 접근 %d건 (%s)" % (
@@ -497,6 +624,7 @@ class Analyzer:
             "requests": a.n, "errors": a.err, "first": fmt_ts(a.first), "last": fmt_ts(a.last),
             "success_warn": any(f["success"] and f["key"] in guide.SUCCESS_WARN_KEYS for f in fs),
             "findings": fs,
+            "is_proxy": ip in self.auto_proxies or ip in self.trusted,
             "user_agent": uas.most_common(1)[0][0] if uas else "",
             "user_agents": uas.most_common(5),
             "statuses": Counter(a.status).most_common(8),
@@ -505,7 +633,9 @@ class Analyzer:
     def result(self, setting=None):
         used, setting, info = self.resolve_mode(setting)
         res = {"mode": used, "setting": setting, "unreliable": info["unreliable"], "reason": info["reason"],
-               "distinct_ips": len(self.ips), "xff_used": self.xff_used, "ips": [], "findings": []}
+               "distinct_ips": len(self.ips), "xff_used": self.xff_used, "ips": [], "findings": [],
+               "auto_proxies": [{"ip": ip, "requests": n} for ip, n in sorted(self.auto_proxies.items(), key=lambda kv: -kv[1])],
+               "errorlog": self.error_summary()}
         if used == "ip":
             ips = [self._ip_result(ip, a) for ip, a in self.ips.items()]
             ips = [x for x in ips if x["level"]]
@@ -517,8 +647,8 @@ class Analyzer:
             for key in guide.REQUEST_LEVEL_KEYS:
                 h = self.glob.get(key)
                 if h:
-                    f = self._hit_finding(key, h, "%d건 (출처 IP %d개%s)" % (
-                        h.count, len(h.ips), "+" if len(h.ips) >= 2000 else ""))
+                    f = self._hit_finding(key, h, "%d건 (출처 IP %d개%s)%s" % (
+                        h.count, len(h.ips), "+" if len(h.ips) >= 2000 else "", _extra_text(h)))
                     f["ips"] = len(h.ips)
                     fs.append(f)
             fs.sort(key=lambda f: (-f["level"], -f["success"], -f["count"]))
